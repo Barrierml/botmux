@@ -12,9 +12,15 @@
 // connections, so the engine must OWN the thread — `thread/start`, run the
 // first turn (persists a rollout within ~0.2s), then the TUI `resume`s it.
 // Subsequent turns are injected by the engine and render live in the TUI.
+// On a botmux resume (daemon restart / re-fork), the engine `thread/resume`s
+// the persisted thread id so RPC mode survives reconnects instead of falling
+// back to the drop-prone paste path (P0).
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:net';
 import { get as httpGet } from 'node:http';
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { WebSocket } from 'ws';
 
 type Json = Record<string, any>;
@@ -32,6 +38,16 @@ async function findFreePort(): Promise<number> {
   });
 }
 
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/** Kill the whole process group (node wrapper + its native app-server child).
+ *  The app-server is spawned `detached`, so its pid is the group leader. */
+function killGroup(pid: number, signal: NodeJS.Signals): void {
+  try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
+}
+
 export interface CodexRpcEngineOpts {
   /** Absolute path to the real `codex` binary. */
   codexBin: string;
@@ -39,8 +55,11 @@ export interface CodexRpcEngineOpts {
   cwd: string;
   /** Child env (must carry CODEX_HOME + proxy vars + BOTMUX_SESSION_ID). */
   env: NodeJS.ProcessEnv;
+  /** botmux session id — used to name the app-server orphan-cleanup marker so a
+   *  new incarnation of this session can reap a prior app-server (P0 teardown). */
+  sessionId?: string;
   log?: LogFn;
-  /** Optional reasoning effort override forwarded to thread/start config. */
+  /** Optional reasoning effort override forwarded to thread config. */
   reasoningEffort?: string;
 }
 
@@ -55,6 +74,8 @@ function autoApproval(method: string): unknown {
   // commandExecution / fileChange requestApproval + anything else: accept.
   return { decision: 'acceptForSession' };
 }
+
+const MARKER_DIR = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers');
 
 export class CodexRpcEngine {
   private child?: ChildProcess;
@@ -77,12 +98,17 @@ export class CodexRpcEngine {
 
   /** Spawn the app-server, connect, and complete the initialize handshake. */
   async start(): Promise<void> {
+    this.reapStaleAppServer();
     this.port = await findFreePort();
     this.child = spawn(this.opts.codexBin, ['app-server', '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdio: ['ignore', 'ignore', 'pipe'],
+      // Own process group so stop()/reap can kill the node wrapper AND its
+      // native app-server child in one shot (killGroup → kill(-pid)).
+      detached: true,
     });
+    this.child.unref(); // don't let the app-server keep the worker's loop alive
     this.child.stderr?.on('data', (c: Buffer) => {
       this.lastStderr = (this.lastStderr + c.toString('utf8')).slice(-4000);
     });
@@ -90,6 +116,7 @@ export class CodexRpcEngine {
     this.child.once('exit', (code, signal) => {
       if (!this.closed) this.failAll(new Error(`codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`));
     });
+    this.writeMarker();
     await this.waitReady(15_000);
     await this.connect(8_000);
     await this.request('initialize', {
@@ -99,17 +126,34 @@ export class CodexRpcEngine {
     this.notify('initialized');
   }
 
-  /** Create the session thread. Its id is what the TUI resumes. */
+  /** Create a fresh session thread. Its id (== codex rollout session id) is what
+   *  the TUI resumes and what botmux persists for future resume. */
   async startThread(): Promise<string> {
+    const r = await this.request('thread/start', this.threadParams());
+    this.threadId = String(r?.thread?.id ?? '');
+    if (!this.threadId) throw new Error('thread/start returned no thread id');
+    return this.threadId;
+  }
+
+  /** Resume the persisted thread after a botmux reconnect (P0 resume-survival),
+   *  so RPC mode stays engaged across daemon restarts instead of reverting to
+   *  the paste path. */
+  async resumeThread(threadId: string): Promise<string> {
+    const params: Json = { ...this.threadParams(), threadId, excludeTurns: true };
+    delete params.serviceName; // resume keeps the original thread's identity
+    const r = await this.request('thread/resume', params);
+    this.threadId = String(r?.thread?.id ?? threadId);
+    return this.threadId;
+  }
+
+  private threadParams(): Json {
     const config: Json = {
       // Forward the full env (incl. BOTMUX_SESSION_ID / BOTMUX_LARK_APP_ID) to
-      // shell subprocesses so `botmux send` from within codex finds its bot —
-      // codex otherwise only forwards a curated allowlist. Mirrors the codex
-      // adapter's read-isolation buildArgs.
+      // shell subprocesses so `botmux send` from within codex finds its bot.
       shell_environment_policy: { inherit: 'all', ignore_default_excludes: true },
     };
     if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
-    const params: Json = {
+    return {
       cwd: this.opts.cwd,
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
@@ -118,16 +162,12 @@ export class CodexRpcEngine {
       persistExtendedHistory: true,
       config,
     };
-    const r = await this.request('thread/start', params);
-    this.threadId = String(r?.thread?.id ?? '');
-    if (!this.threadId) throw new Error('thread/start returned no thread id');
-    return this.threadId;
   }
 
   /** Inject one user message as a turn. Resolves when the app-server acks the
    *  turn start (fast); the turn itself streams to the attached TUI. */
   async sendTurn(content: string): Promise<void> {
-    if (!this.threadId) throw new Error('sendTurn before startThread');
+    if (!this.threadId) throw new Error('sendTurn before startThread/resumeThread');
     await this.request('turn/start', {
       threadId: this.threadId,
       input: [{ type: 'text', text: content, text_elements: [] }],
@@ -140,11 +180,46 @@ export class CodexRpcEngine {
   stop(): void {
     this.closed = true;
     try { this.ws?.close(); } catch { /* already gone */ }
-    try { this.child?.kill('SIGTERM'); } catch { /* already gone */ }
+    if (this.child?.pid) { try { killGroup(this.child.pid, 'SIGTERM'); } catch { /* already gone */ } }
+    this.removeMarker();
     this.failAll(new Error('engine stopped'));
   }
 
-  // ---- internals ----------------------------------------------------------
+  // ---- app-server orphan marker (P0 teardown) ------------------------------
+
+  private markerPath(): string | undefined {
+    if (!this.opts.sessionId) return undefined;
+    return join(MARKER_DIR, `${this.opts.sessionId}.pid`);
+  }
+
+  /** Kill an app-server left behind by a prior incarnation of this session
+   *  (e.g. the worker was SIGKILLed so its exit hooks never ran). */
+  private reapStaleAppServer(): void {
+    const mp = this.markerPath();
+    if (!mp || !existsSync(mp)) return;
+    try {
+      const pid = parseInt(readFileSync(mp, 'utf8').trim(), 10);
+      if (Number.isInteger(pid) && pid > 0 && isAlive(pid)) {
+        killGroup(pid, 'SIGKILL'); // orphan from a crashed worker — no grace needed
+        this.log(`[codex-rpc] reaped stale app-server pid ${pid}`);
+      }
+      rmSync(mp, { force: true });
+    } catch { /* best effort */ }
+  }
+
+  private writeMarker(): void {
+    const mp = this.markerPath();
+    if (!mp || !this.child?.pid) return;
+    try { mkdirSync(MARKER_DIR, { recursive: true }); writeFileSync(mp, String(this.child.pid), { mode: 0o600 }); }
+    catch { /* best effort */ }
+  }
+
+  private removeMarker(): void {
+    const mp = this.markerPath();
+    if (mp) { try { rmSync(mp, { force: true }); } catch { /* */ } }
+  }
+
+  // ---- internals -----------------------------------------------------------
 
   private waitReady(timeoutMs: number): Promise<void> {
     const deadline = Date.now() + timeoutMs;

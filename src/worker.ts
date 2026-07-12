@@ -6001,13 +6001,15 @@ process.on('message', async (raw: unknown) => {
         // create the botmux-owned thread + first turn BEFORE spawnCli, so the
         // pane launches `codex --remote <ws> resume <thread>` (see codex.ts
         // buildArgs) and input flows via JSON-RPC instead of a drop-prone paste.
-        // Scoped to fresh, non-isolated codex sessions with a prompt; any failure
-        // cleanly falls back to normal paste mode. readIsolation is excluded
-        // because its per-bot CODEX_HOME wouldn't match this app-server's env.
+        // Fresh sessions need a prompt; a botmux resume re-engages RPC against the
+        // persisted thread so it survives daemon restarts (P0). Non-isolated only
+        // (per-bot CODEX_HOME wouldn't match the app-server env); adopt excluded;
+        // any failure cleanly falls back to normal paste mode.
+        const codexRpcResume = msg.resume === true && !!msg.cliSessionId;
         if (
           msg.codexRpcInput === true && msg.cliId === 'codex' &&
-          !!msg.prompt && msg.resume !== true && msg.adoptMode !== true &&
-          msg.readIsolation !== true
+          msg.adoptMode !== true && msg.readIsolation !== true &&
+          (!!msg.prompt || codexRpcResume)
         ) {
           try {
             const codexBin = createCliAdapterSync('codex', msg.cliPathOverride).resolvedBin;
@@ -6015,14 +6017,17 @@ process.on('message', async (raw: unknown) => {
             engineEnv.PATH = `${join(homedir(), '.botmux', 'bin')}:${engineEnv.PATH ?? ''}`;
             engineEnv.BOTMUX_SESSION_ID = msg.sessionId;
             engineEnv.BOTMUX_LARK_APP_ID = msg.larkAppId;
-            const engine = new CodexRpcEngine({ codexBin, cwd: msg.workingDir, env: engineEnv, log: (m: string) => log(m) });
+            const engine = new CodexRpcEngine({ codexBin, cwd: msg.workingDir, env: engineEnv, sessionId: msg.sessionId, log: (m: string) => log(m) });
             await engine.start();
-            const threadId = await engine.startThread();
-            await engine.sendTurn(msg.prompt);
+            const threadId = codexRpcResume
+              ? await engine.resumeThread(msg.cliSessionId!)
+              : await engine.startThread();
+            if (msg.prompt) await engine.sendTurn(msg.prompt);
+            persistCliSessionId(threadId);
             codexRpcEngine = engine;
             codexRemoteWsUrl = engine.wsUrl;
             codexRemoteThreadId = threadId;
-            log(`Codex RPC input engaged: app-server ${engine.wsUrl} thread ${threadId} (first turn sent via JSON-RPC)`);
+            log(`Codex RPC input engaged (${codexRpcResume ? 'resume' : 'fresh'}): app-server ${engine.wsUrl} thread ${threadId}${msg.prompt ? ' (turn via JSON-RPC)' : ''}`);
           } catch (err: any) {
             log(`Codex RPC input failed to start (${err?.message ?? err}); falling back to paste mode`);
             try { codexRpcEngine?.stop(); } catch { /* best effort */ }
