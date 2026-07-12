@@ -1789,6 +1789,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resumeOrTurnId: bo
     launchShell: botCfg.launchShell,
     model: agentCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
+    codexRpcInput: botCfg.codexRpcInput === true,
     // Startup commands run on every fresh spawn (incl. resume) so session-only
     // settings like `/effort ultracode` are re-established. Adopt sessions are
     // observed, not driven — forkAdoptWorker intentionally omits this.
@@ -2938,6 +2939,7 @@ export function forkAdoptWorker(ds: DaemonSession, opts?: { restoredFromMetadata
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
     model: botCfg.model,
     disableCliBypass: botCfg.disableCliBypass === true,
+    codexRpcInput: botCfg.codexRpcInput === true,
     prompt: '',
     resume: false,
     ownerOpenId: ds.ownerOpenId,

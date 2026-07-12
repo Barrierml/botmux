@@ -508,6 +508,13 @@ export interface BotConfig {
    */
   disableCliBypass?: boolean;
   /**
+   * Codex only (opt-in, experimental): deliver user input via the app-server
+   * JSON-RPC channel instead of a tmux paste. The pane runs `codex --remote`
+   * attached to a botmux-owned app-server thread, so input can't be dropped by
+   * codex's terminal re-init. No effect on non-codex bots.
+   */
+  codexRpcInput?: boolean;
+  /**
    * Run this bot's CLI inside a per-session file sandbox (bubblewrap, Linux):
    * the agent sees only a clone of the project + a de-identified config dir,
    * never the host home/secrets/other sessions. Intended for oncall bots shared
@@ -1396,6 +1403,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.model.trim()
         : undefined,
       disableCliBypass: entry.disableCliBypass === true,
+      codexRpcInput: entry.codexRpcInput === true,
       sandbox: entry.sandbox === true,
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
