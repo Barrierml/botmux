@@ -59,8 +59,13 @@ export interface CodexRpcEngineOpts {
    *  new incarnation of this session can reap a prior app-server (P0 teardown). */
   sessionId?: string;
   log?: LogFn;
-  /** Optional reasoning effort override forwarded to thread config. */
+  /** Optional model + reasoning effort forwarded to thread config (P1). */
+  model?: string;
   reasoningEffort?: string;
+  /** Called once if the app-server dies unexpectedly (not via stop()). The
+   *  worker uses it to kill the now-orphaned `codex --remote` pane so the normal
+   *  exit→daemon-refork→resume path re-engages RPC on a fresh app-server (P1). */
+  onDead?: () => void;
 }
 
 /** Server→client requests are auto-answered so codex never blocks on a human;
@@ -85,6 +90,7 @@ export class CodexRpcEngine {
   private port = 0;
   private threadId?: string;
   private closed = false;
+  private deadNotified = false;
   private lastStderr = '';
   private readonly log: LogFn;
 
@@ -152,6 +158,7 @@ export class CodexRpcEngine {
       // shell subprocesses so `botmux send` from within codex finds its bot.
       shell_environment_policy: { inherit: 'all', ignore_default_excludes: true },
     };
+    if (this.opts.model) config.model = this.opts.model;
     if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
     return {
       cwd: this.opts.cwd,
@@ -301,5 +308,9 @@ export class CodexRpcEngine {
     if (this.pending.size) this.log(`[codex-rpc] ${err.message}`);
     for (const p of this.pending.values()) p.reject(err);
     this.pending.clear();
+    if (!this.closed && !this.deadNotified) {
+      this.deadNotified = true;
+      try { this.opts.onDead?.(); } catch { /* best effort */ }
+    }
   }
 }

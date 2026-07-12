@@ -6008,7 +6008,7 @@ process.on('message', async (raw: unknown) => {
         const codexRpcResume = msg.resume === true && !!msg.cliSessionId;
         if (
           msg.codexRpcInput === true && msg.cliId === 'codex' &&
-          msg.adoptMode !== true && msg.readIsolation !== true &&
+          msg.adoptMode !== true && msg.readIsolation !== true && msg.sandbox !== true &&
           (!!msg.prompt || codexRpcResume)
         ) {
           try {
@@ -6017,7 +6017,19 @@ process.on('message', async (raw: unknown) => {
             engineEnv.PATH = `${join(homedir(), '.botmux', 'bin')}:${engineEnv.PATH ?? ''}`;
             engineEnv.BOTMUX_SESSION_ID = msg.sessionId;
             engineEnv.BOTMUX_LARK_APP_ID = msg.larkAppId;
-            const engine = new CodexRpcEngine({ codexBin, cwd: msg.workingDir, env: engineEnv, sessionId: msg.sessionId, log: (m: string) => log(m) });
+            const engine = new CodexRpcEngine({
+              codexBin, cwd: msg.workingDir, env: engineEnv, sessionId: msg.sessionId,
+              model: msg.model, log: (m: string) => log(m),
+              onDead: () => {
+                // app-server died → the `codex --remote` pane is orphaned. Kill it
+                // so the pane exit → daemon re-fork → RPC resume path rebuilds a
+                // fresh app-server and re-engages RPC (P1 crash recovery).
+                if (codexRpcEngine === engine) {
+                  log('Codex RPC app-server died; killing pane to trigger resume-restart');
+                  try { killCli(); } catch { /* best effort */ }
+                }
+              },
+            });
             await engine.start();
             const threadId = codexRpcResume
               ? await engine.resumeThread(msg.cliSessionId!)
