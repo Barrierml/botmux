@@ -135,6 +135,13 @@ export interface DashboardGlobalConfig {
    *  ON (absent ⇒ enabled); set false to disable from the dashboard. Read live
    *  by the daemon — see config.ts `resolveChatBotDiscoveryConfig`. */
   chatBotDiscovery?: boolean;
+  /** Experimental: globally enable RPC input mode for RPC-capable codex-family
+   *  bots (codex / traex) — user input goes via the app-server JSON-RPC channel
+   *  instead of a tmux paste, bypassing codex's terminal paste-drop. Default OFF
+   *  (absent ⇒ off); flip on to enable fleet-wide. Read live by the daemon —
+   *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
+   *  force-enables regardless of this global default. */
+  codexRpcInput?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -232,6 +239,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (typeof d.publicReadOnly === 'boolean') out.publicReadOnly = d.publicReadOnly;
   if (typeof d.openTerminalInFeishu === 'boolean') out.openTerminalInFeishu = d.openTerminalInFeishu;
   if (typeof d.chatBotDiscovery === 'boolean') out.chatBotDiscovery = d.chatBotDiscovery;
+  if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
