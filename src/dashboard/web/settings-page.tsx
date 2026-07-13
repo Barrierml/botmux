@@ -67,7 +67,7 @@ function parseSettings(s: any): DashboardSettings {
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
     chatBotDiscovery: s?.chatBotDiscovery !== false,
-    codexRpcInput: s?.codexRpcInput !== false,
+    codexRpcInput: s?.codexRpcInput === true,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,

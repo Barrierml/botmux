@@ -697,7 +697,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
     chatBotDiscovery: dashboard.chatBotDiscovery !== false, // default ON
-    codexRpcInput: dashboard.codexRpcInput !== false, // default ON
+    codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,
