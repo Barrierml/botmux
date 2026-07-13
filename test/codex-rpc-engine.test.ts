@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { chmodSync } from 'node:fs';
+import { chmodSync, mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { spawn } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
+
+const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 // A real subprocess app-server stand-in (HTTP /readyz + JSON-RPC WS on one port).
 const FIXTURE = fileURLToPath(new URL('./fixtures/fake-codex-app-server.mjs', import.meta.url));
@@ -64,6 +69,26 @@ describe('CodexRpcEngine — failure/recovery paths', () => {
     await new Promise((r) => setTimeout(r, 1500)); // let the fixture exit(1)
     expect(dead).toBe(true);
     engine.stop();
+  }, 20_000);
+
+  it('P1-2: reapStaleAppServer refuses to kill a REUSED pid that is not our app-server', async () => {
+    // Simulate a marker left by a SIGKILLed worker whose pid was reused by an
+    // unrelated process (a harmless `sleep`, NOT an app-server). A broken guard
+    // would kill it; the identity check (argv has no `app-server`) must spare it.
+    const sid = `reuse-guard-${Math.round(performance.now())}`;
+    const dir = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers');
+    mkdirSync(dir, { recursive: true });
+    const marker = join(dir, `${sid}.pid`);
+    const sleeper = spawn('sleep', ['30'], { detached: true });
+    sleeper.unref();
+    await new Promise((r) => setTimeout(r, 200));
+    writeFileSync(marker, `${sleeper.pid}\nws://127.0.0.1:59999`); // reused pid + a url it can't have
+
+    const engine = makeEngine({ sessionId: sid });
+    await engine.start();            // triggers reapStaleAppServer(sid)
+    expect(isAlive(sleeper.pid!)).toBe(true); // NOT mis-killed
+    engine.stop();
+    try { process.kill(-sleeper.pid!, 'SIGKILL'); } catch { /* */ }
   }, 20_000);
 
   it('stop() is idempotent and does NOT fire onDead (expected teardown)', async () => {

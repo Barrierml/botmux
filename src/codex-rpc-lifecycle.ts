@@ -50,6 +50,67 @@ export interface PaneProbes {
   childrenOf?: (pid: number) => number[];
 }
 
+/** Injected effects for the init-time RPC state machine (real ones wired by the
+ *  worker; fakes by tests). */
+export interface RpcInitEffects {
+  paneInfo: (sessionId: string) => { name: string; live: boolean } | null;
+  paneIsRemote: (sessionName: string) => boolean;
+  engage: () => Promise<boolean>;          // engageCodexRpc(cfg) — sets the module engine on success
+  killVerify: (sessionName: string) => Promise<boolean>; // kill stale pane, VERIFY gone
+  teardownEngine: () => void;              // stop engine + clear remote vars
+  log: (m: string) => void;
+  notify: (m: string) => void;             // user-visible failure notice
+}
+
+export interface RpcInitDecision {
+  /** RPC is active → spawnCli will launch the `--remote resume` TUI. */
+  engaged: boolean;
+  /** The init prompt must be QUEUED (resume path: delivered by flushPending →
+   *  sendTurn once the TUI is ready) rather than pre-sent (fresh) or pasted. */
+  queuePrompt: boolean;
+  /** A stale `--remote` pane could not be replaced — the caller MUST NOT run
+   *  spawnCli (it would reattach the dead pane against the fresh-port engine). */
+  abortSpawn: boolean;
+}
+
+/** Pure init-time state machine for codex-family RPC, extracted so the
+ *  fresh/resume/kill-failure ORDERING is unit-testable (the worker only wires
+ *  real effects + acts on the decision). Mirrors the four cases:
+ *   - not eligible                     → nothing (paste).
+ *   - no live pane (fresh or resume-  → engage; fresh pre-sends the first turn
+ *     without a surviving pane)          inside engage, resume must queue it.
+ *   - live RPC-owned pane              → engage, then kill+VERIFY the stale pane;
+ *                                         on success respawn (queue the prompt),
+ *                                         on failure tear the engine down + abort
+ *                                         spawn (never attach a stale remote pane
+ *                                         to a fresh-port engine — Codex P0-2).
+ *   - live native paste pane           → leave it (fail-closed paste, boundary #3). */
+export async function orchestrateCodexRpcInit(cfg: InitCfg, fx: RpcInitEffects): Promise<RpcInitDecision> {
+  const NONE: RpcInitDecision = { engaged: false, queuePrompt: false, abortSpawn: false };
+  if (!codexRpcEligible(cfg)) return NONE;
+  const wantResume = cfg.resume === true && !!cfg.cliSessionId;
+  const pane = fx.paneInfo(cfg.sessionId);
+  if (!pane || !pane.live) {
+    const engaged = await fx.engage();
+    // fresh (!wantResume) pre-sends the first turn inside engage (empty threads
+    // can't be resumed by the TUI, so the rollout must exist first); resume has
+    // no pre-send → its prompt must be queued for post-ready flush.
+    return { engaged, queuePrompt: engaged && wantResume, abortSpawn: false };
+  }
+  if (fx.paneIsRemote(pane.name)) {
+    const engaged = await fx.engage();
+    if (!engaged) return NONE; // engine didn't come up → paste (nothing touched)
+    const gone = await fx.killVerify(pane.name);
+    if (gone) return { engaged: true, queuePrompt: true, abortSpawn: false }; // RPC-owned survivor ⇒ always a resume
+    fx.teardownEngine();
+    fx.notify('Codex RPC 会话恢复失败：无法替换旧 --remote 面板。请重试，或 /close 后重开会话。');
+    fx.log(`Codex RPC resume: FAILED to kill stale --remote pane ${pane.name}; aborting init (never attach a stale remote pane to a fresh-port engine)`);
+    return { engaged: false, queuePrompt: false, abortSpawn: true };
+  }
+  fx.log('Codex RPC: surviving pane is native paste (not RPC-owned) — keeping paste for this restore');
+  return NONE;
+}
+
 function tmuxPanePid(sessionName: string): number | undefined {
   try {
     const out = execFileSync('tmux', ['display', '-t', sessionName, '-p', '#{pane_pid}'],

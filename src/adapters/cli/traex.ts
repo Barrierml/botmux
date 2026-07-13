@@ -162,7 +162,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
       // shape, so this is identical to the codex adapter's branch.
       if (remoteWsUrl && remoteThreadId) {
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', remoteThreadId];
+        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
+        // so an interactive update dialog would freeze the resume. TraeX shares
+        // codex's config schema; disable at the process level, never user-global.
+        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', remoteThreadId];
       }
       const baseArgs = [
         ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),

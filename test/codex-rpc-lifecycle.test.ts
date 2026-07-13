@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { codexRpcEligible, paneRunsRemoteTui, RPC_CAPABLE_CLIS, type PaneProbes } from '../src/codex-rpc-lifecycle.js';
+import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, RPC_CAPABLE_CLIS, type PaneProbes, type RpcInitEffects } from '../src/codex-rpc-lifecycle.js';
 import type { DaemonToWorker } from '../src/types.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
@@ -107,5 +107,71 @@ describe('paneRunsRemoteTui — RPC-owned detection via leaf argv (not pane_curr
     expect(paneRunsRemoteTui('bmx-1', probes({
       100: { comm: 'zsh', argv: ['-zsh'], children: [100] },
     }))).toBe(false);
+  });
+});
+
+describe('orchestrateCodexRpcInit — fresh / resume / kill-failure ordering (Codex P0-1/P0-2)', () => {
+  function fx(over: Partial<RpcInitEffects> & { pane?: { name: string; live: boolean } | null; isRemote?: boolean; engaged?: boolean; killGone?: boolean } = {}) {
+    const calls: string[] = [];
+    const effects: RpcInitEffects = {
+      paneInfo: () => { calls.push('paneInfo'); return over.pane ?? null; },
+      paneIsRemote: () => { calls.push('paneIsRemote'); return over.isRemote ?? false; },
+      engage: async () => { calls.push('engage'); return over.engaged ?? true; },
+      killVerify: async () => { calls.push('killVerify'); return over.killGone ?? true; },
+      teardownEngine: () => { calls.push('teardownEngine'); },
+      log: () => {},
+      notify: () => { calls.push('notify'); },
+    };
+    return { effects, calls };
+  }
+
+  it('not eligible → no-op, engine never engaged', async () => {
+    const { effects, calls } = fx();
+    const d = await orchestrateCodexRpcInit(baseCfg({ codexRpcInput: false }), effects);
+    expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: false });
+    expect(calls).not.toContain('engage');
+  });
+
+  it('FRESH new session (no pane) → engage, first turn pre-sent (do NOT queue)', async () => {
+    const { effects, calls } = fx({ pane: null });
+    const d = await orchestrateCodexRpcInit(baseCfg(), effects);
+    expect(d).toEqual({ engaged: true, queuePrompt: false, abortSpawn: false });
+    expect(calls).toContain('engage');
+  });
+
+  it('RESUME whose pane did NOT survive → engage(resume), MUST queue the waking prompt (P0-1)', async () => {
+    const { effects } = fx({ pane: null });
+    const d = await orchestrateCodexRpcInit(baseCfg({ prompt: 'wake up', resume: true, cliSessionId: 't1' }), effects);
+    expect(d).toEqual({ engaged: true, queuePrompt: true, abortSpawn: false });
+  });
+
+  it('live RPC-owned pane + kill succeeds → engage, replace, queue the prompt', async () => {
+    const { effects, calls } = fx({ pane: { name: 'bmx-1', live: true }, isRemote: true, killGone: true });
+    const d = await orchestrateCodexRpcInit(baseCfg({ prompt: 'hi', resume: true, cliSessionId: 't1' }), effects);
+    expect(d).toEqual({ engaged: true, queuePrompt: true, abortSpawn: false });
+    expect(calls).toEqual(['paneInfo', 'paneIsRemote', 'engage', 'killVerify']);
+  });
+
+  it('live RPC-owned pane + kill FAILS → tear engine down + ABORT spawn, notify (P0-2)', async () => {
+    const { effects, calls } = fx({ pane: { name: 'bmx-1', live: true }, isRemote: true, killGone: false });
+    const d = await orchestrateCodexRpcInit(baseCfg({ prompt: 'hi', resume: true, cliSessionId: 't1' }), effects);
+    expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: true });
+    expect(calls).toContain('teardownEngine');
+    expect(calls).toContain('notify'); // user is told, not silently frozen
+  });
+
+  it('live RPC-owned pane but engage FAILS → no kill attempted, falls back to paste', async () => {
+    const { effects, calls } = fx({ pane: { name: 'bmx-1', live: true }, isRemote: true, engaged: false });
+    const d = await orchestrateCodexRpcInit(baseCfg({ resume: true, cliSessionId: 't1' }), effects);
+    expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: false });
+    expect(calls).not.toContain('killVerify'); // never kill a pane without a live engine
+  });
+
+  it('live NATIVE paste pane (possibly mid-turn) → left untouched, no engage (boundary #3)', async () => {
+    const { effects, calls } = fx({ pane: { name: 'bmx-1', live: true }, isRemote: false });
+    const d = await orchestrateCodexRpcInit(baseCfg({ resume: true, cliSessionId: 't1' }), effects);
+    expect(d).toEqual({ engaged: false, queuePrompt: false, abortSpawn: false });
+    expect(calls).not.toContain('engage');
+    expect(calls).not.toContain('killVerify');
   });
 });

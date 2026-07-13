@@ -21,7 +21,7 @@
 // port each incarnation) — reattaching the prior pane would leave it pointed at
 // the now-dead prior app-server (that lifecycle bug, not any non-broadcast, is
 // what froze the Web terminal). See codex-rpc-lifecycle + worker engageCodexRpc.
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { createServer } from 'node:net';
 import { get as httpGet } from 'node:http';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
@@ -137,6 +137,7 @@ export class CodexRpcEngine {
     });
     this.child.once('error', err => this.failAll(new Error(`codex app-server spawn failed: ${err.message}`)));
     this.child.once('exit', (code, signal) => {
+      this.removeMarker(); // child confirmed dead → drop its orphan marker
       if (!this.closed) this.failAll(new Error(`codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`));
     });
     this.writeMarker();
@@ -189,23 +190,40 @@ export class CodexRpcEngine {
   }
 
   /** Inject one user message as a turn. Resolves when the app-server acks the
-   *  turn start (fast); the turn itself streams to the attached TUI. */
-  async sendTurn(content: string): Promise<void> {
+   *  turn start (fast); the turn itself streams to the attached TUI.
+   *  `clientUserMessageId` (a stable botmux turn id) is forwarded so codex can
+   *  correlate/dedupe a resend — but correctness does NOT depend on codex
+   *  deduping: the worker never auto-re-queues an RPC turn (the app-server owns
+   *  execution once the turn is accepted), so a lost/late ack becomes a manual
+   *  submit-failure rather than a silent double-execution (P1-1). */
+  async sendTurn(content: string, clientUserMessageId?: string): Promise<void> {
     if (!this.threadId) throw new Error('sendTurn before startThread/resumeThread');
-    await this.request('turn/start', {
+    const params: Json = {
       threadId: this.threadId,
       input: [{ type: 'text', text: content, text_elements: [] }],
       cwd: this.opts.cwd,
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'dangerFullAccess' },
-    });
+    };
+    if (clientUserMessageId) params.clientUserMessageId = clientUserMessageId;
+    await this.request('turn/start', params);
   }
 
   stop(): void {
     this.closed = true;
     try { this.ws?.close(); } catch { /* already gone */ }
-    if (this.child?.pid) { try { killGroup(this.child.pid, 'SIGTERM'); } catch { /* already gone */ } }
-    this.removeMarker();
+    const pid = this.child?.pid;
+    if (pid) {
+      // Bounded SIGTERM → SIGKILL: don't leave a stubborn child as an untracked
+      // orphan. The marker is removed by the child 'exit' handler (confirmed
+      // dead), NOT here — if the child ignores SIGTERM and this worker then dies,
+      // the surviving marker lets the next incarnation reap it (P1-2).
+      try { killGroup(pid, 'SIGTERM'); } catch { /* already gone */ }
+      const t = setTimeout(() => { if (isAlive(pid)) { try { killGroup(pid, 'SIGKILL'); } catch { /* */ } } }, 2000);
+      t.unref?.();
+    } else {
+      this.removeMarker();
+    }
     this.failAll(new Error('engine stopped'));
   }
 
@@ -216,14 +234,33 @@ export class CodexRpcEngine {
     return join(MARKER_DIR, `${this.opts.sessionId}.pid`);
   }
 
+  /** Verify a pid is actually OUR app-server before signalling it — the marker
+   *  can outlive a SIGKILLed worker and its pid may be REUSED by an unrelated
+   *  process (daemon runs as root → mis-kill would be severe). Match the process
+   *  argv against `app-server` AND, when recorded, the exact `--listen <url>` a
+   *  reused pid could not carry (P1-2). */
+  private processIsOurAppServer(pid: number, markedUrl?: string): boolean {
+    let argv = '';
+    try { argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); }
+    catch {
+      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); }
+      catch { return false; }
+    }
+    if (!/\bapp-server\b/.test(argv)) return false;
+    if (markedUrl && !argv.includes(markedUrl)) return false;
+    return true;
+  }
+
   /** Kill an app-server left behind by a prior incarnation of this session
-   *  (e.g. the worker was SIGKILLed so its exit hooks never ran). */
+   *  (e.g. the worker was SIGKILLed so its exit hooks never ran). Identity-checked
+   *  so a reused pid is never mis-killed. */
   private reapStaleAppServer(): void {
     const mp = this.markerPath();
     if (!mp || !existsSync(mp)) return;
     try {
-      const pid = parseInt(readFileSync(mp, 'utf8').trim(), 10);
-      if (Number.isInteger(pid) && pid > 0 && isAlive(pid)) {
+      const [pidStr, markedUrl] = readFileSync(mp, 'utf8').trim().split('\n');
+      const pid = parseInt(pidStr, 10);
+      if (Number.isInteger(pid) && pid > 0 && isAlive(pid) && this.processIsOurAppServer(pid, markedUrl)) {
         killGroup(pid, 'SIGKILL'); // orphan from a crashed worker — no grace needed
         this.log(`[codex-rpc] reaped stale app-server pid ${pid}`);
       }
@@ -234,7 +271,8 @@ export class CodexRpcEngine {
   private writeMarker(): void {
     const mp = this.markerPath();
     if (!mp || !this.child?.pid) return;
-    try { mkdirSync(MARKER_DIR, { recursive: true }); writeFileSync(mp, String(this.child.pid), { mode: 0o600 }); }
+    // pid + the exact --listen url so a reused pid fails the identity check.
+    try { mkdirSync(MARKER_DIR, { recursive: true }); writeFileSync(mp, `${this.child.pid}\n${this.wsUrl}`, { mode: 0o600 }); }
     catch { /* best effort */ }
   }
 

@@ -95,7 +95,7 @@ import {
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
-import { codexRpcEligible, paneRunsRemoteTui } from './codex-rpc-lifecycle.js';
+import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
@@ -226,7 +226,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       // even if the model skips `botmux send`; CodexBridgeQueue is path-agnostic
       // until it discovers the transcript, so the pre-spawn mark is fine.
       codexBridgeMarkPendingTurn(cfg.prompt, cfg.turnId);
-      await engine.sendTurn(cfg.prompt);
+      await engine.sendTurn(cfg.prompt, cfg.turnId);
     }
     persistCliSessionId(threadId);
     codexRpcEngine = engine;
@@ -254,18 +254,27 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
 function armRpcStartupDialogDismiss(): void {
   if (rpcDialogDismissTimer) { clearTimeout(rpcDialogDismissTimer); rpcDialogDismissTimer = null; }
   const deadline = Date.now() + 30_000;
-  const STARTUP_BLOCK = /Press enter to continue|Update available|Skip until next version|Update now \(runs/i;
+  // The update dialog is disabled at the source via `-c check_for_update_on_startup=false`
+  // (codex.ts/traex.ts buildArgs). This watcher is only a fail-safe. It must NEVER
+  // blind-press keys on an update menu — the default selection can be "Update now",
+  // which would trigger a self-update. So: if an update dialog is somehow present
+  // (config not honored), WARN and do nothing. Only a plain "Press enter to
+  // continue" with NO update/menu options gets a single safe Enter.
+  const UPDATE_DIALOG = /Update available|Update now \(runs|Skip until next version/i;
+  const SAFE_CONTINUE = /Press enter to continue/i;
+  let warnedUpdate = false;
   const tick = (): void => {
     rpcDialogDismissTimer = null;
     if (!codexRpcEngine || !backend) return;                 // RPC torn down / pane gone
     if (Date.now() > deadline) { log('Codex RPC: startup-dialog watch timed out'); return; }
     let screen = '';
     try { screen = renderer?.snapshot().content ?? ''; } catch { /* renderer not ready yet */ }
-    const composerUp = cliAdapter?.readyPattern?.test(screen) === true;
-    if (STARTUP_BLOCK.test(screen)) {
-      log('Codex RPC: dismissing codex startup dialog on the --remote pane (Enter)');
+    if (UPDATE_DIALOG.test(screen)) {
+      if (!warnedUpdate) { warnedUpdate = true; log('Codex RPC: update dialog appeared despite check_for_update_on_startup=false — NOT auto-pressing (default may be "Update now"); pane may need manual dismissal'); }
+    } else if (SAFE_CONTINUE.test(screen)) {
+      log('Codex RPC: dismissing a safe "press enter to continue" prompt on the --remote pane');
       try { backend.write('\r'); } catch { /* best effort */ }
-    } else if (composerUp) {
+    } else if (cliAdapter?.readyPattern?.test(screen) === true) {
       return; // composer reached with no blocking dialog → done
     }
     rpcDialogDismissTimer = setTimeout(tick, 2000);
@@ -3765,7 +3774,14 @@ async function flushPending(): Promise<void> {
       const item = pendingMessages.shift()!;
       // Track as in-flight until the CLI returns to idle (markPromptReady).
       // If the CLI exits first, onExit stashes these for re-queue on respawn.
-      inflightInputs.onWrite(item);
+      // EXCEPT in RPC mode: the app-server (not the pane) owns turn execution, so
+      // once turn/start is sent the turn runs regardless of the pane. Re-queuing
+      // it on a pane restart would RE-SEND an already-accepted turn → double
+      // execution (same class as #443's double-submit). So RPC turns are never
+      // auto-re-queued: a lost/late ack surfaces as a submit-failure the user can
+      // resend manually, and the stable clientUserMessageId lets codex dedupe a
+      // resend (Codex delta P1-1).
+      if (!codexRpcEngine) inflightInputs.onWrite(item);
       const msg = item.content;
       currentBotmuxTurnId = item.turnId;
       writeCliPidMarker();
@@ -3803,7 +3819,7 @@ async function flushPending(): Promise<void> {
           // renders. No tmux paste → the history.jsonl verify/retry/recover
           // machinery is bypassed. A throw here falls into the catch below and
           // surfaces as a normal submit-failure notice.
-          await codexRpcEngine.sendTurn(msg);
+          await codexRpcEngine.sendTurn(msg, item.turnId);
           result = { submitted: true };
         } else {
           result = await cliAdapter.writeInput(backend, msg);
@@ -6131,50 +6147,29 @@ process.on('message', async (raw: unknown) => {
         }
         // Hybrid codex RPC input (opt-in): bind the pane to a botmux-owned
         // app-server thread; input flows via JSON-RPC instead of a drop-prone
-        // paste. engageCodexRpc stands up the engine + thread (ready BEFORE we
-        // touch the pane, boundary #1); the pane is then launched/respawned as
-        // `codex --remote resume` (codex.ts buildArgs) against the CURRENT
-        // app-server. Each incarnation uses a fresh port, so a surviving pane from
-        // a prior lifetime points at a now-dead app-server and MUST be replaced —
-        // but only if it is confirmed RPC-owned (live `--remote` argv); a native
-        // paste pane is left untouched (fail-closed to paste, boundary #3). Any
-        // failure falls back to normal paste. See engageCodexRpc.
-        if (codexRpcEligible(msg)) {
-          const pane = persistentPaneInfo(msg.backendType ?? config.daemon.backendType, msg.sessionId);
-          if (!pane || !pane.live) {
-            // Fresh session, or a resume whose pane didn't survive → engage; spawnCli
-            // fresh-launches the --remote TUI against the new engine.
-            await engageCodexRpc(msg);
-          } else if (paneRunsRemoteTui(pane.name)) {
-            // Surviving pane is an RPC `--remote` TUI pointing at the now-dead prior
-            // app-server. Re-engage (engine ready first), then controlled-respawn:
-            // kill the stale pane so spawnCli fresh-launches the TUI against the
-            // CURRENT app-server. This teardown sits WITHIN the existing daemon-
-            // restart worker-reconnect window (the Web terminal/WebSocket is already
-            // reconnecting), and no onExit handler is registered yet (pre-spawnCli)
-            // so nothing spurious fires (boundary #5).
-            if (await engageCodexRpc(msg)) {
-              // killPersistentSession returns void and swallows errors, so a plain
-              // try/catch can't observe a failed kill. VERIFY the session is gone;
-              // if it survives, spawnCli would reattach the stale dead-`--remote`
-              // pane against the new engine's fresh port and re-trigger the P0
-              // freeze — so tear the engine down and fail loud to paste instead
-              // (Codex delta point 1).
-              const gone = await killPersistentSessionVerified((msg.backendType ?? config.daemon.backendType) as PersistentBackendType, pane.name);
-              if (gone) {
-                log(`Codex RPC resume: replaced stale --remote pane; respawning TUI against ${remoteWsUrl}`);
-              } else {
-                log(`Codex RPC resume: FAILED to kill stale --remote pane ${pane.name}; reverting to paste (not attaching a stale remote pane to a fresh engine)`);
-                try { codexRpcEngine?.stop(); } catch { /* best effort */ }
-                codexRpcEngine = undefined; remoteWsUrl = undefined; remoteThreadId = undefined;
-              }
-            }
-          } else {
-            // A native paste pane (possibly mid-turn) survived — do NOT force-kill
-            // it to switch modes. Fail-closed to paste this restore; RPC engages on
-            // the next fresh session (boundary #3). Paste reattach stays unchanged.
-            log('Codex RPC: surviving pane is native paste (not RPC-owned) — keeping paste for this restore');
-          }
+        // paste. The pure orchestrator (codex-rpc-lifecycle) decides fresh vs
+        // resume vs stale-pane-replace vs fail-closed; the worker wires the real
+        // effects and acts on the decision. On a kill-verify failure it ABORTS
+        // init (throws) rather than let spawnCli reattach a dead `--remote` pane
+        // to the fresh-port engine (Codex delta P0-2). engageCodexRpc readies the
+        // engine + thread BEFORE any pane is touched (boundary #1); the pane is
+        // then launched/respawned as `codex --remote resume` (codex.ts buildArgs)
+        // against the CURRENT app-server (a fresh port each incarnation).
+        const rpcBackendType = msg.backendType ?? config.daemon.backendType;
+        const rpcDecision = await orchestrateCodexRpcInit(msg, {
+          paneInfo: (sid) => persistentPaneInfo(rpcBackendType, sid),
+          paneIsRemote: (name) => paneRunsRemoteTui(name),
+          engage: () => engageCodexRpc(msg),
+          killVerify: (name) => killPersistentSessionVerified(rpcBackendType as PersistentBackendType, name),
+          teardownEngine: () => { try { codexRpcEngine?.stop(); } catch { /* */ } codexRpcEngine = undefined; remoteWsUrl = undefined; remoteThreadId = undefined; },
+          log: (m) => log(m),
+          notify: (m) => send({ type: 'user_notify', message: m, turnId: msg.turnId }),
+        });
+        if (rpcDecision.engaged) log(`Codex RPC resume: pane bound to ${remoteWsUrl}`);
+        if (rpcDecision.abortSpawn) {
+          // Stale --remote pane couldn't be replaced — refuse to attach it. Abort
+          // init so the daemon retries a clean incarnation instead of freezing.
+          throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
         spawnCli(msg);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
@@ -6205,9 +6200,16 @@ process.on('message', async (raw: unknown) => {
           // transcript file.
           codexBridgeMarkPendingTurn(msg.prompt, msg.turnId);
         }
-        if (msg.prompt && !codexRpcEngine && (!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt)) {
-          // codexRpcEngine !== undefined → the first prompt was already delivered
-          // via JSON-RPC turn/start above; don't also queue it for a tmux paste.
+        if (msg.prompt && (!codexRpcEngine || rpcDecision.queuePrompt) && (!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt)) {
+          // Queue the initial prompt for flushPending. Cases:
+          //  - paste (!codexRpcEngine): normal queue.
+          //  - RPC FRESH (engine set, !queuePrompt): the first turn was already
+          //    pre-sent via JSON-RPC inside engageCodexRpc (to persist the rollout
+          //    an empty thread can't be resumed from) → do NOT re-queue.
+          //  - RPC RESUME (engine set, queuePrompt): the waking prompt was NOT
+          //    pre-sent → queue it so flushPending delivers it via sendTurn AFTER
+          //    the respawned --remote TUI is ready (Codex delta P0-1). The bridge
+          //    is marked at flush time, not here.
           pendingMessages.push({ content: msg.prompt, turnId: msg.turnId });
         }
 
