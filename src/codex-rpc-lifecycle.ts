@@ -92,6 +92,17 @@ export interface PaneProbes {
  *   - 'not-engaged' — setup failed OR fresh frame never dispatched → paste. */
 export type EngageOutcome = 'accepted' | 'ambiguous' | 'resumed' | 'not-engaged';
 
+/** Whether the FRESH first turn should PRE-mark the codex bridge (so the reply is
+ *  attributed even if the model skips `botmux send`). ONLY 'accepted' — a
+ *  confirmed turn whose prompt is not re-queued, so exactly one mark exists and
+ *  the reply consumes it. NOT 'ambiguous' (no positive evidence the turn ran → an
+ *  unstarted queue head would wedge every later turn's drain — Codex P1) and NOT
+ *  'not-sent'/'resumed' (those never reach the pre-mark; not-sent's paste flush
+ *  marks once, resume flushes its queued prompt). */
+export function shouldPreMarkFirstTurn(outcome: EngageOutcome): boolean {
+  return outcome === 'accepted';
+}
+
 /** Injected effects for the init-time RPC state machine (real ones wired by the
  *  worker; fakes by tests). */
 export interface RpcInitEffects {

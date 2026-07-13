@@ -103,7 +103,7 @@ import {
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
-import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, type EngageOutcome } from './codex-rpc-lifecycle.js';
+import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
@@ -252,11 +252,6 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
     let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
     if (!wantResume && cfg.prompt) {
-      // First turn must persist the rollout before the TUI resumes it. Mark the
-      // bridge first (P1-4) so the structured fallback can attribute the reply
-      // even if the model skips `botmux send`; CodexBridgeQueue is path-agnostic
-      // until it discovers the transcript, so the pre-spawn mark is fine.
-      codexBridgeMarkPendingTurn(cfg.prompt, cfg.turnId);
       // Three-state delivery (P1-1, exactly-once priority): 'accepted' (ack or
       // rollout evidence), 'not-sent' (frame never dispatched → safe paste), or
       // 'ambiguous' (dispatched, unconfirmed → engaged but NEVER resend).
@@ -264,11 +259,21 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         (tid) => codexRolloutProbe(cfg.cliId, tid, cfg.prompt, 12_000));
       if (first === 'not-sent') {
         // The turn/start frame never left → the turn cannot have run → tear the
-        // engine down and fall back to paste (single execution).
+        // engine down and fall back to paste. flushPending marks the bridge once
+        // on the paste path — we must NOT pre-mark here or that would double-mark
+        // the same turnId and leave a stale, never-consumed queue head (Codex P1).
         log('Codex RPC fresh first turn: frame not dispatched → falling back to paste (safe, single execution)');
         try { engine.stop(); } catch { /* best effort */ }
         return 'not-engaged';
       }
+      // Bridge mark ONLY for a confirmed-accepted turn — so the structured
+      // fallback can attribute the reply even if the model skips `botmux send`.
+      // Marked here (after the outcome, before persistCliSessionId/attach — late
+      // attach from offset 0 still matches, timing-safe). 'ambiguous' does NOT
+      // mark: there is no positive evidence the turn ran, and an unstarted head
+      // would permanently block every later turn's drain — the notify + Web
+      // terminal are the authoritative recovery surface (Codex P1).
+      if (shouldPreMarkFirstTurn(first)) codexBridgeMarkPendingTurn(cfg.prompt, cfg.turnId);
       outcome = first; // 'accepted' | 'ambiguous' — both stay engaged, prompt never re-queued
     }
     persistCliSessionId(threadId);
