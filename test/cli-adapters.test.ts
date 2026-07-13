@@ -44,13 +44,14 @@ import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
+import { createKiroCliAdapter } from '../src/adapters/cli/kiro-cli.js';
 import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok'];
+const ALL_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'codex-app', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'mira', 'mir', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok', 'kiro-cli'];
 
 // ---------------------------------------------------------------------------
 // 1. Factory: createCliAdapterSync
@@ -85,7 +86,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'kimi', 'grok', 'kiro-cli'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -1316,6 +1317,7 @@ describe('systemHints', () => {
     ['hermes', () => createHermesAdapter('/bin/hermes')],
     ['pi', () => createPiAdapter('/bin/pi')],
     ['copilot', () => createCopilotAdapter('/bin/copilot')],
+    ['kiro-cli', () => createKiroCliAdapter('/bin/kiro-cli')],
   ];
 
   it.each(nonClaudeAdapters)('%s systemHints include botmux send routing guidance', (_name, factory) => {
@@ -1344,6 +1346,7 @@ describe('id property', () => {
     ['mira', () => createMiraAdapter()],
     ['pi', () => createPiAdapter('/bin/pi')],
     ['copilot', () => createCopilotAdapter('/bin/copilot')],
+    ['kiro-cli', () => createKiroCliAdapter('/bin/kiro-cli')],
   ];
 
   it.each(expected)('adapter id is "%s"', (expectedId, factory) => {
@@ -1406,6 +1409,10 @@ describe('altScreen property', () => {
 
   it('copilot uses alt screen (Ink TUI)', () => {
     expect(createCopilotAdapter('/bin/copilot').altScreen).toBe(true);
+  });
+
+  it('kiro-cli uses alt screen', () => {
+    expect(createKiroCliAdapter('/bin/kiro-cli').altScreen).toBe(true);
   });
 });
 
@@ -1822,6 +1829,57 @@ describe('kimi buildArgs', () => {
 
   it('surfaces curated model choices for setup', () => {
     expect(adapter.modelChoices).toContain('kimi-k2.5');
+  });
+});
+
+describe('kiro-cli buildArgs', () => {
+  const adapter = createKiroCliAdapter('/usr/bin/kiro-cli');
+
+  it('starts the documented chat command and pre-trusts core tools by default', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: false });
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell']);
+  });
+
+  it('omits trust flags when disableCliBypass is true', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: false, disableCliBypass: true });
+    expect(args).toEqual(['chat']);
+  });
+
+  it('keeps the initial prompt on stdin so the adapter can capture /session-id first', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: false, initialPrompt: 'hello kiro' });
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell']);
+    expect(args).not.toContain('hello kiro');
+    expect(adapter.passesInitialPromptViaArgs).toBeFalsy();
+  });
+
+  it('resumes a specific Kiro session id when available', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-kiro',
+      resume: true,
+      resumeSessionId: 'kiro-native-session',
+    });
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell', '--resume-id', 'kiro-native-session']);
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-kiro', cliSessionId: 'kiro-native-session' }))
+      .toBe('kiro-cli chat --resume-id kiro-native-session');
+  });
+
+  it('does not use directory-latest resume without an explicit Kiro session id', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: true });
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell']);
+    expect(args).not.toContain('--resume');
+    expect(adapter.buildResumeCommand?.({ sessionId: 'sess-kiro' })).toBeNull();
+  });
+
+  it('ignores model because Kiro has no chat --model flag', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-kiro', resume: false, model: 'claude-opus-4.8' });
+    expect(args).toEqual(['chat', '--trust-tools=read,write,shell']);
+    expect(args).not.toContain('--model');
+    expect(args).not.toContain('claude-opus-4.8');
+  });
+
+  it('keeps Kiro auth, settings, skills, and SQLite sessions real in the sandbox', () => {
+    expect(adapter.authPaths).toEqual(['~/.kiro']);
+    expect(adapter.skillsDir).toBe('~/.kiro/skills');
   });
 });
 

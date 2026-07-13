@@ -11,6 +11,8 @@ interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: Mainte
 interface DashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
+  enableLocalCliOpen: boolean;
+  localCliOpenMode: 'attach' | 'resume';
   chatBotDiscovery: boolean;
   codexRpcInput: boolean;
   vcMeetingAgent: {
@@ -66,6 +68,8 @@ function parseSettings(s: any): DashboardSettings {
   return {
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
+    enableLocalCliOpen: s?.enableLocalCliOpen === true,
+    localCliOpenMode: s?.localCliOpenMode === 'resume' ? 'resume' : 'attach',
     chatBotDiscovery: s?.chatBotDiscovery !== false,
     codexRpcInput: s?.codexRpcInput === true,
     vcMeetingAgent: {
@@ -436,12 +440,16 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'chatBotDiscovery' | 'codexRpcInput' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const repoModeOptions = useMemo(() => [
     { value: 'all' as const, label: tr('settings.repoPickerModeAll') },
     { value: 'repos' as const, label: tr('settings.repoPickerModeRepos') },
+  ], [tr]);
+  const localCliModeOptions = useMemo(() => [
+    { value: 'attach' as const, label: tr('settings.localCliOpenModeAttach') },
+    { value: 'resume' as const, label: tr('settings.localCliOpenModeResume') },
   ], [tr]);
   const vcListenerOptions = useMemo(() => [
     { value: '', label: tr('settings.vcMeetingListenerBotAuto') },
@@ -491,6 +499,27 @@ function SettingsBody(props: {
             disabled={dis || savingKey === 'openTerminalInFeishu'}
             onChange={value => saveBoolean('openTerminalInFeishu', value)}
           />
+          <ToggleRow
+            title={tr('settings.enableLocalCliOpen')}
+            help={tr('settings.enableLocalCliOpenHelp')}
+            checked={settings.enableLocalCliOpen}
+            disabled={dis || savingKey === 'enableLocalCliOpen'}
+            onChange={value => saveBoolean('enableLocalCliOpen', value)}
+          />
+          <div className="settings-field-row">
+            <FieldTitle help={tr('settings.localCliOpenModeHelp')}>{tr('settings.localCliOpenMode')}</FieldTitle>
+            <DropdownMenu
+              className="settings-field-menu"
+              ariaLabel={tr('settings.localCliOpenMode')}
+              disabled={dis || !settings.enableLocalCliOpen || savingKey === 'localCliOpenMode'}
+              value={settings.localCliOpenMode}
+              label={dropdownLabel(localCliModeOptions, settings.localCliOpenMode)}
+              options={localCliModeOptions}
+              onChange={value => {
+                void props.onSave('localCliOpenMode', { localCliOpenMode: value }, s => ({ ...s, localCliOpenMode: value }));
+              }}
+            />
+          </div>
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionExperimental')}>
           <ToggleRow

@@ -84,6 +84,7 @@ describe('parseBotSelection', () => {
 
   it('selects by custom process name', () => {
     expect(parseBotSelection('botmux-claude-main', bots)).toBe(0);
+    expect(parseBotSelection('claude-main', bots)).toBe(0);
   });
 
   it('selects by app id', () => {
@@ -311,6 +312,7 @@ describe('resolveCliId', () => {
     expect(resolveCliId('20')).toBe('kimi');
     expect(resolveCliId('21')).toBe('genius');
     expect(resolveCliId('22')).toBe('grok');
+    expect(resolveCliId('23')).toBe('kiro-cli');
   });
 
   it('passes through literal cliIds unchanged', () => {
@@ -323,6 +325,7 @@ describe('resolveCliId', () => {
     expect(resolveCliId('pi')).toBe('pi');
     expect(resolveCliId('copilot')).toBe('copilot');
     expect(resolveCliId('grok')).toBe('grok');
+    expect(resolveCliId('kiro-cli')).toBe('kiro-cli');
   });
 
   it('throws on typos so they do not leak into bots.json', () => {

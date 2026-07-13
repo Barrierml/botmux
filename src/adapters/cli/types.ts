@@ -51,9 +51,18 @@ export interface SkillDeliveryCapability {
   readonly supportsExclusive: boolean;
 }
 
+export interface McpGatewayInstallSpec {
+  /** Stable CLI-global config file that receives the single `botmux` entry. */
+  readonly configPath: string;
+  readonly format: 'codex-toml' | 'claude-json';
+}
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
+
+  /** Declarative config target for the process-scoped Botmux MCP Gateway. */
+  readonly mcpGateway?: McpGatewayInstallSpec;
 
   /** Resolved absolute path to the CLI binary */
   readonly resolvedBin: string;
@@ -388,4 +397,4 @@ export interface CliAdapter {
   readonly defaultPassthroughCommands?: readonly string[];
 }
 
-export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok';
+export type CliId = 'claude-code' | 'seed' | 'relay' | 'aiden' | 'coco' | 'codex' | 'codex-app' | 'cursor' | 'gemini' | 'genius' | 'opencode' | 'antigravity' | 'mtr' | 'hermes' | 'mira' | 'mir' | 'traex' | 'pi' | 'copilot' | 'oh-my-pi' | 'kimi' | 'grok' | 'kiro-cli';
