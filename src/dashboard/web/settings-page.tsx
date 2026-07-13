@@ -12,6 +12,7 @@ interface DashboardSettings {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   chatBotDiscovery: boolean;
+  codexRpcInput: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId: string | null;
@@ -66,6 +67,7 @@ function parseSettings(s: any): DashboardSettings {
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
     chatBotDiscovery: s?.chatBotDiscovery !== false,
+    codexRpcInput: s?.codexRpcInput !== false,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: typeof s?.vcMeetingAgent?.listenerBotAppId === 'string' ? s.vcMeetingAgent.listenerBotAppId : null,
@@ -434,7 +436,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'chatBotDiscovery' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'chatBotDiscovery' | 'codexRpcInput' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const repoModeOptions = useMemo(() => [
@@ -497,6 +499,13 @@ function SettingsBody(props: {
             checked={settings.chatBotDiscovery}
             disabled={dis || savingKey === 'chatBotDiscovery'}
             onChange={value => saveBoolean('chatBotDiscovery', value)}
+          />
+          <ToggleRow
+            title={tr('settings.codexRpcInput')}
+            help={tr('settings.codexRpcInputHelp')}
+            checked={settings.codexRpcInput}
+            disabled={dis || savingKey === 'codexRpcInput'}
+            onChange={value => saveBoolean('codexRpcInput', value)}
           />
         </SettingsBlock>
         <SettingsBlock title={tr('settings.sectionWhiteboard')}>

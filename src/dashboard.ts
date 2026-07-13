@@ -300,6 +300,7 @@ interface ResolvedDashboardSettings {
   openTerminalInFeishu: boolean;
   /** Experimental current-chat bot discovery via Lark `/members/bots`. Default ON. */
   chatBotDiscovery: boolean;
+  codexRpcInput: boolean;
   /** Machine-wide VC meeting listener kill-switch. Default ON. */
   vcMeetingAgent: {
     enabled: boolean;
@@ -696,6 +697,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
     chatBotDiscovery: dashboard.chatBotDiscovery !== false, // default ON
+    codexRpcInput: dashboard.codexRpcInput !== false, // default ON
     vcMeetingAgent: {
       enabled: global.vcMeetingAgent?.enabled !== false,
       listenerBotAppId: global.vcMeetingAgent?.listenerBotAppId ?? null,

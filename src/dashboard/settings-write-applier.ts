@@ -38,6 +38,7 @@ export interface ResolvedDashboardSettingsView {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   chatBotDiscovery: boolean;
+  codexRpcInput: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     listenerBotAppId?: string | null;
@@ -134,6 +135,7 @@ export type ApplySettingsWriteError =
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
   | 'invalid_chatBotDiscovery'
+  | 'invalid_codexRpcInput'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -189,6 +191,12 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_chatBotDiscovery' };
     }
     patch.chatBotDiscovery = obj.chatBotDiscovery;
+  }
+  if ('codexRpcInput' in obj) {
+    if (typeof obj.codexRpcInput !== 'boolean') {
+      return { ok: false, error: 'invalid_codexRpcInput' };
+    }
+    patch.codexRpcInput = obj.codexRpcInput;
   }
 
   let touched = false;
