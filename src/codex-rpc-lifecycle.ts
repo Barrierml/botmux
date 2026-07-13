@@ -43,6 +43,37 @@ export function codexRpcEligible(cfg: InitCfg): boolean {
   );
 }
 
+/** Positive rollout evidence that THIS turn's user message was persisted (P1-1).
+ *  Given a thread's drained rollout events, is there a user turn matching the
+ *  prompt? session_meta (written at thread/start) is not a `kind:'user'` event,
+ *  so an empty thread yields false — filename existence alone would not. Match is
+ *  normalized-equal OR contains (codex may prepend AGENTS.md context to the first
+ *  turn); the fresh-thread scope makes a contains-match unambiguous. */
+export function rolloutUserTurnMatches(events: ReadonlyArray<{ kind: string; text: string }>, promptText: string): boolean {
+  const norm = (s: string) => s.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  const needle = norm(promptText);
+  if (!needle) return false;
+  return events.some(e => e.kind === 'user' && (norm(e.text) === needle || norm(e.text).includes(needle)));
+}
+
+/** Decide what to do about a codex startup dialog on an RPC `--remote` pane
+ *  (P1-3 / P2). An RPC pane has no terminal input path, so a blocking dialog
+ *  freezes the viewer. The update menu is disabled at the source (-c
+ *  check_for_update_on_startup=false); this is only a fail-safe:
+ *   - 'warn-update'  — an update menu is present (default may be "Update now") →
+ *                      NEVER auto-press; warn the user, they dismiss manually.
+ *   - 'dismiss-safe' — a plain "press enter to continue" with no menu → safe Enter.
+ *   - 'ready'        — composer reached, no blocking dialog → stop watching.
+ *   - 'wait'         — nothing actionable yet.
+ *  UPDATE_DIALOG takes precedence, so a screen with both an update menu AND a
+ *  "press enter" line is warned, never pressed. */
+export function decideStartupDialogAction(screen: string, readyPattern?: RegExp): 'warn-update' | 'dismiss-safe' | 'ready' | 'wait' {
+  if (/Update available|Update now \(runs|Skip until next version/i.test(screen)) return 'warn-update';
+  if (/Press enter to continue/i.test(screen)) return 'dismiss-safe';
+  if (readyPattern?.test(screen) === true) return 'ready';
+  return 'wait';
+}
+
 export interface PaneProbes {
   panePidOf?: (sessionName: string) => number | undefined;
   argvOf?: (pid: number) => string[];
@@ -50,16 +81,47 @@ export interface PaneProbes {
   childrenOf?: (pid: number) => number[];
 }
 
+/** Outcome of an engage attempt (exactly-once-priority three-state for fresh +
+ *  the resume/setup states):
+ *   - 'accepted'    — fresh first turn confirmed (ack or rollout evidence), or a
+ *                     resume that needs its waking prompt queued is 'resumed'.
+ *   - 'ambiguous'   — fresh first turn dispatched but unconfirmed → engaged, but
+ *                     the prompt must NOT be resent (P1-1); caller notifies.
+ *   - 'resumed'     — resume path engaged (no turn sent) → the waking prompt must
+ *                     be queued for post-ready flush.
+ *   - 'not-engaged' — setup failed OR fresh frame never dispatched → paste. */
+export type EngageOutcome = 'accepted' | 'ambiguous' | 'resumed' | 'not-engaged';
+
 /** Injected effects for the init-time RPC state machine (real ones wired by the
  *  worker; fakes by tests). */
 export interface RpcInitEffects {
   paneInfo: (sessionId: string) => { name: string; live: boolean } | null;
   paneIsRemote: (sessionName: string) => boolean;
-  engage: () => Promise<boolean>;          // engageCodexRpc(cfg) — sets the module engine on success
+  engage: () => Promise<EngageOutcome>;    // engageCodexRpc(cfg) — sets the module engine on success
   killVerify: (sessionName: string) => Promise<boolean>; // kill stale pane, VERIFY gone
   teardownEngine: () => void;              // stop engine + clear remote vars
   log: (m: string) => void;
-  notify: (m: string) => void;             // user-visible failure notice
+  notify: (m: string) => void;             // user-visible notice
+}
+
+/** Whether the initial prompt should be pushed to pendingMessages (the exact
+ *  worker wiring, extracted so the P1-1 exactly-once guarantee is unit-testable):
+ *   - paste (no RPC engine)            → queue as usual.
+ *   - RPC RESUME (engine + queuePrompt) → queue the waking prompt for post-ready flush.
+ *   - RPC FRESH accepted/ambiguous      → engine set + queuePrompt=false → NEVER
+ *     queue (the turn was pre-sent or is ambiguous; re-queuing would double-execute).
+ *  args-baked first prompts skip the queue unless deferred for startup commands. */
+export function shouldQueueInitialPrompt(o: {
+  hasPrompt: boolean;
+  rpcEngineActive: boolean;
+  queuePrompt: boolean;
+  passesInitialPromptViaArgs: boolean;
+  deferInitialPrompt: boolean;
+}): boolean {
+  if (!o.hasPrompt) return false;
+  const wantsQueue = !o.rpcEngineActive || o.queuePrompt;
+  if (!wantsQueue) return false;
+  return !o.passesInitialPromptViaArgs || o.deferInitialPrompt;
 }
 
 export interface RpcInitDecision {
@@ -88,20 +150,35 @@ export interface RpcInitDecision {
 export async function orchestrateCodexRpcInit(cfg: InitCfg, fx: RpcInitEffects): Promise<RpcInitDecision> {
   const NONE: RpcInitDecision = { engaged: false, queuePrompt: false, abortSpawn: false };
   if (!codexRpcEligible(cfg)) return NONE;
-  const wantResume = cfg.resume === true && !!cfg.cliSessionId;
   const pane = fx.paneInfo(cfg.sessionId);
   if (!pane || !pane.live) {
-    const engaged = await fx.engage();
-    // fresh (!wantResume) pre-sends the first turn inside engage (empty threads
-    // can't be resumed by the TUI, so the rollout must exist first); resume has
-    // no pre-send → its prompt must be queued for post-ready flush.
-    return { engaged, queuePrompt: engaged && wantResume, abortSpawn: false };
+    // Fresh session, or a resume whose pane didn't survive.
+    const outcome = await fx.engage();
+    switch (outcome) {
+      case 'accepted':
+        // Fresh first turn confirmed delivered → engaged, do NOT re-queue.
+        return { engaged: true, queuePrompt: false, abortSpawn: false };
+      case 'ambiguous':
+        // Fresh first turn dispatched but unconfirmed → engaged, but NEVER resend
+        // (exactly-once). The notify is the authoritative result; the viewer
+        // resume recovers the turn if it actually landed. The prompt is NOT
+        // queued (queuePrompt:false) and must never reach pending/inflight.
+        fx.notify('⚠️ 首条消息已发出但未收到确认。为避免重复执行未自动重发；请查看终端结果，如未执行请手动重发。');
+        return { engaged: true, queuePrompt: false, abortSpawn: false };
+      case 'resumed':
+        // Resume engaged (no pre-send) → queue the waking prompt for post-ready flush.
+        return { engaged: true, queuePrompt: true, abortSpawn: false };
+      case 'not-engaged':
+        return NONE; // setup failed or frame never dispatched → safe paste fallback
+    }
   }
   if (fx.paneIsRemote(pane.name)) {
-    const engaged = await fx.engage();
-    if (!engaged) return NONE; // engine didn't come up → paste (nothing touched)
+    // Surviving RPC `--remote` pane on the now-dead prior app-server (always a
+    // resume). Re-engage, then replace the stale pane.
+    const outcome = await fx.engage();
+    if (outcome === 'not-engaged') return NONE; // engine didn't come up → paste (nothing touched)
     const gone = await fx.killVerify(pane.name);
-    if (gone) return { engaged: true, queuePrompt: true, abortSpawn: false }; // RPC-owned survivor ⇒ always a resume
+    if (gone) return { engaged: true, queuePrompt: true, abortSpawn: false };
     fx.teardownEngine();
     fx.notify('Codex RPC 会话恢复失败：无法替换旧 --remote 面板。请重试，或 /close 后重开会话。');
     fx.log(`Codex RPC resume: FAILED to kill stale --remote pane ${pane.name}; aborting init (never attach a stale remote pane to a fresh-port engine)`);

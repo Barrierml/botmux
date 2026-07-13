@@ -137,7 +137,7 @@ export class CodexRpcEngine {
     });
     this.child.once('error', err => this.failAll(new Error(`codex app-server spawn failed: ${err.message}`)));
     this.child.once('exit', (code, signal) => {
-      this.removeMarker(); // child confirmed dead → drop its orphan marker
+      this.removeMarkerIfOwned(); // child confirmed dead → drop OUR marker only (ABA-safe)
       if (!this.closed) this.failAll(new Error(`codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`));
     });
     this.writeMarker();
@@ -192,11 +192,13 @@ export class CodexRpcEngine {
   /** Inject one user message as a turn. Resolves when the app-server acks the
    *  turn start (fast); the turn itself streams to the attached TUI.
    *  `clientUserMessageId` (a stable botmux turn id) is forwarded so codex can
-   *  correlate/dedupe a resend — but correctness does NOT depend on codex
-   *  deduping: the worker never auto-re-queues an RPC turn (the app-server owns
-   *  execution once the turn is accepted), so a lost/late ack becomes a manual
-   *  submit-failure rather than a silent double-execution (P1-1). */
-  async sendTurn(content: string, clientUserMessageId?: string): Promise<void> {
+   *  CORRELATE the message — NOT relied on for dedupe (the 0.144.1 schema carries
+   *  it but promises no idempotency). Correctness comes from the caller never
+   *  auto-resending an accepted turn (P1-1).
+   *  opts.fatalOnTimeout=false makes a timeout reject only THIS request instead of
+   *  tearing the engine down — used for the fresh first turn, whose ambiguity is
+   *  then resolved against rollout persistence (see sendFirstTurn). */
+  async sendTurn(content: string, clientUserMessageId?: string, opts?: { timeoutMs?: number; fatalOnTimeout?: boolean }): Promise<void> {
     if (!this.threadId) throw new Error('sendTurn before startThread/resumeThread');
     const params: Json = {
       threadId: this.threadId,
@@ -206,7 +208,53 @@ export class CodexRpcEngine {
       sandboxPolicy: { type: 'dangerFullAccess' },
     };
     if (clientUserMessageId) params.clientUserMessageId = clientUserMessageId;
-    await this.request('turn/start', params);
+    await this.request('turn/start', params, opts);
+  }
+
+  /** Deliver the FRESH first turn and resolve its outcome as one of THREE states,
+   *  prioritising exactly-once over never-lost (P1-1). An empty thread can't be
+   *  resumed by the TUI, so the first turn must persist the rollout before the
+   *  pane spawns — but a lost/late ack must NOT be blindly re-pasted (that would
+   *  double-execute, the failure users care about most):
+   *    - 'accepted'  — ack received, OR (ack lost) the rollout already contains
+   *                    THIS turn's user message → engaged, never resend.
+   *    - 'not-sent'  — the turn/start FRAME was never dispatched (ws not open /
+   *                    send threw) → the turn cannot have run → safe paste once.
+   *    - 'ambiguous' — the frame WAS dispatched but no ack AND no positive rollout
+   *                    evidence (timeout / transport / server / unknown error) →
+   *                    it may have executed → NEVER auto-paste; the caller notifies
+   *                    the user and lets the viewer resume (recovers if it landed).
+   *  Only "frame not dispatched" is treated as safe; every dispatched-then-failed
+   *  case is ambiguous, and a timeout is non-fatal so the engine survives to serve
+   *  the accepted/ambiguous cases. `rolloutProbe` is the ground-truth positive
+   *  check (matches this turn's user_message in the persisted rollout). */
+  async sendFirstTurn(content: string, clientUserMessageId: string | undefined, rolloutProbe: (threadId: string) => Promise<boolean>): Promise<'accepted' | 'not-sent' | 'ambiguous'> {
+    const threadId = this.threadId;
+    if (!threadId) throw new Error('sendFirstTurn before startThread');
+    let dispatched = false;
+    const params: Json = {
+      threadId,
+      input: [{ type: 'text', text: content, text_elements: [] }],
+      cwd: this.opts.cwd,
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    };
+    if (clientUserMessageId) params.clientUserMessageId = clientUserMessageId;
+    try {
+      await this.request('turn/start', params, { timeoutMs: this.opts.requestTimeoutMs ?? 15_000, fatalOnTimeout: false }, () => { dispatched = true; });
+      return 'accepted'; // ack received
+    } catch (err) {
+      if (!dispatched) {
+        this.log(`[codex-rpc] first turn/start not dispatched (${(err as Error).message}); safe to paste`);
+        return 'not-sent';
+      }
+      // Dispatched but no ack — the ONLY safe resolution is positive rollout
+      // evidence; absence is NOT proof it didn't run (it may persist >window or be
+      // queued server-side), so no-evidence stays ambiguous.
+      this.log(`[codex-rpc] first turn ack lost after dispatch (${(err as Error).message}); checking rollout for positive evidence`);
+      const landed = await rolloutProbe(threadId);
+      return landed ? 'accepted' : 'ambiguous';
+    }
   }
 
   stop(): void {
@@ -222,7 +270,7 @@ export class CodexRpcEngine {
       const t = setTimeout(() => { if (isAlive(pid)) { try { killGroup(pid, 'SIGKILL'); } catch { /* */ } } }, 2000);
       t.unref?.();
     } else {
-      this.removeMarker();
+      this.removeMarkerIfOwned();
     }
     this.failAll(new Error('engine stopped'));
   }
@@ -276,9 +324,18 @@ export class CodexRpcEngine {
     catch { /* best effort */ }
   }
 
-  private removeMarker(): void {
+  /** Remove the marker ONLY if it still names THIS engine's app-server (pid +
+   *  wsUrl). Prevents an ABA race: a same-session engine B may have already
+   *  reaped + rewritten the marker with its own pid/url by the time this (old)
+   *  engine's child exits late — an unconditional delete would orphan B's live
+   *  app-server (no marker → next incarnation can't reap it). P1-2. */
+  private removeMarkerIfOwned(): void {
     const mp = this.markerPath();
-    if (mp) { try { rmSync(mp, { force: true }); } catch { /* */ } }
+    if (!mp) return;
+    try {
+      const [pidStr, url] = readFileSync(mp, 'utf8').trim().split('\n');
+      if (parseInt(pidStr, 10) === this.child?.pid && url === this.wsUrl) rmSync(mp, { force: true });
+    } catch { /* no marker / unreadable → leave it (next reap handles it) */ }
   }
 
   // ---- internals -----------------------------------------------------------
@@ -316,22 +373,39 @@ export class CodexRpcEngine {
     });
   }
 
-  private request(method: string, params: unknown, timeoutMs: number = this.opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS): Promise<any> {
+  private request(
+    method: string,
+    params: unknown,
+    opts?: { timeoutMs?: number; fatalOnTimeout?: boolean },
+    onDispatch?: () => void,
+  ): Promise<any> {
+    const timeoutMs = opts?.timeoutMs ?? this.opts.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
+    const fatalOnTimeout = opts?.fatalOnTimeout !== false; // default fatal
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (!this.pending.has(id)) return;
-        // A connected-but-wedged app-server is FATAL, not a one-off: rejecting
-        // just this request would leave the engine + pane alive and every later
-        // turn/start would time out again. Route through failAll so ALL inflight
-        // requests reject AND onDead fires — the worker then kills the pane →
-        // exit → restart → re-engage on a fresh app-server, and the inflight turn
-        // enters the existing restart/re-queue path (P1-5, Codex delta point 3).
-        this.failAll(new Error(`codex app-server request '${method}' timed out after ${timeoutMs}ms`));
+        const err = new Error(`codex app-server request '${method}' timed out after ${timeoutMs}ms`);
+        if (fatalOnTimeout) {
+          // A connected-but-wedged app-server is FATAL for live turns: rejecting
+          // just this request would leave the engine + pane alive and every later
+          // turn/start would time out again. Route through failAll so ALL inflight
+          // requests reject AND onDead fires — the worker then kills the pane →
+          // exit → restart → re-engage on a fresh app-server (P1-5).
+          this.failAll(err);
+        } else {
+          // Non-fatal (the fresh first turn): reject only THIS request and keep
+          // the engine alive, so its ambiguity can be resolved against rollout
+          // persistence and the viewer can still resume if the turn landed (P1-1).
+          this.pending.delete(id); reject(err);
+        }
       }, timeoutMs);
       timer.unref?.();
       this.pending.set(id, { resolve, reject, timer });
-      try { this.send({ jsonrpc: '2.0', id, method, params }); }
+      // onDispatch fires ONLY after send() succeeds (ws was OPEN + no throw) — the
+      // frame is then on the socket, so any later failure is "dispatched" and must
+      // be treated as ambiguous, never not-sent (Codex P1-1 boundary).
+      try { this.send({ jsonrpc: '2.0', id, method, params }); onDispatch?.(); }
       catch (e) { this.pending.delete(id); clearTimeout(timer); reject(e as Error); }
     });
   }

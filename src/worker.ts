@@ -103,7 +103,7 @@ import {
 import { createCliAdapterSync, locateOnPath } from './adapters/cli/registry.js';
 import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper } from './setup/cli-selection.js';
 import { findLaunchedCliPid, scheduleWrapperRealCliPid, readComm, isBareShellComm, bareShellLaunchKind } from './core/session-discovery.js';
-import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit } from './codex-rpc-lifecycle.js';
+import { codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
 import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
@@ -185,6 +185,28 @@ async function killPersistentSessionVerified(backendType: PersistentBackendType,
   return !persistentPaneInfo(backendType, name)?.live;
 }
 
+/** Poll the codex/traex rollout for POSITIVE evidence that the fresh first turn's
+ *  user message was persisted (P1-1). Used only to resolve a dispatched-but-
+ *  unacked first turn: a hit means the app-server accepted the turn → 'accepted'
+ *  (never resend); no hit within the window stays 'ambiguous' (NOT downgraded to
+ *  safe). A wrong sessions root (custom CODEX_HOME) simply fails to find → stays
+ *  ambiguous, which is the safe direction. */
+async function codexRolloutProbe(cliId: string, threadId: string, promptText: string, timeoutMs: number): Promise<boolean> {
+  const findPath = cliId === 'traex' ? findTraexRolloutBySessionId : findCodexRolloutBySessionId;
+  const deadline = Date.now() + timeoutMs;
+  do {
+    try {
+      const path = findPath(threadId);
+      if (path) {
+        const { events } = drainCodexRollout(path, 0);
+        if (rolloutUserTurnMatches(events, promptText)) return true;
+      }
+    } catch { /* keep polling */ }
+    await delay(400);
+  } while (Date.now() < deadline);
+  return false;
+}
+
 /** Stand up (or re-establish) the per-session codex app-server + botmux-owned
  *  thread and point remote{WsUrl,ThreadId} at it, so the next spawnCli launches
  *  `codex --remote <ws> resume <thread>` and input flows over JSON-RPC. Fully
@@ -200,8 +222,8 @@ async function killPersistentSessionVerified(backendType: PersistentBackendType,
  *  (verified), hence the first turn must persist the rollout BEFORE the pane
  *  spawns; it renders as history and later turns stream live. "thread ready" is
  *  thus a distinct step from "first turn sent". */
-async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<boolean> {
-  if (!codexRpcEligible(cfg)) return false;
+async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<EngageOutcome> {
+  if (!codexRpcEligible(cfg)) return 'not-engaged';
   const wantResume = cfg.resume === true && !!cfg.cliSessionId;
   if (codexRpcEngine) { try { codexRpcEngine.stop(); } catch { /* */ } codexRpcEngine = undefined; remoteWsUrl = undefined; remoteThreadId = undefined; }
   let engine: CodexRpcEngine | undefined;
@@ -228,25 +250,38 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     });
     await engine.start();
     const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
+    let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
     if (!wantResume && cfg.prompt) {
       // First turn must persist the rollout before the TUI resumes it. Mark the
       // bridge first (P1-4) so the structured fallback can attribute the reply
       // even if the model skips `botmux send`; CodexBridgeQueue is path-agnostic
       // until it discovers the transcript, so the pre-spawn mark is fine.
       codexBridgeMarkPendingTurn(cfg.prompt, cfg.turnId);
-      await engine.sendTurn(cfg.prompt, cfg.turnId);
+      // Three-state delivery (P1-1, exactly-once priority): 'accepted' (ack or
+      // rollout evidence), 'not-sent' (frame never dispatched → safe paste), or
+      // 'ambiguous' (dispatched, unconfirmed → engaged but NEVER resend).
+      const first = await engine.sendFirstTurn(cfg.prompt, cfg.turnId,
+        (tid) => codexRolloutProbe(cfg.cliId, tid, cfg.prompt, 12_000));
+      if (first === 'not-sent') {
+        // The turn/start frame never left → the turn cannot have run → tear the
+        // engine down and fall back to paste (single execution).
+        log('Codex RPC fresh first turn: frame not dispatched → falling back to paste (safe, single execution)');
+        try { engine.stop(); } catch { /* best effort */ }
+        return 'not-engaged';
+      }
+      outcome = first; // 'accepted' | 'ambiguous' — both stay engaged, prompt never re-queued
     }
     persistCliSessionId(threadId);
     codexRpcEngine = engine;
     remoteWsUrl = engine.wsUrl;
     remoteThreadId = threadId;
-    log(`Codex RPC input engaged (${wantResume ? 'resume' : 'fresh'}): app-server ${engine.wsUrl} thread ${threadId}${!wantResume && cfg.prompt ? ' (first turn via JSON-RPC)' : ''}`);
-    return true;
+    log(`Codex RPC input engaged (${outcome}${wantResume ? '/resume' : '/fresh'}): app-server ${engine.wsUrl} thread ${threadId}`);
+    return outcome;
   } catch (err: any) {
     log(`Codex RPC input failed to start (${err?.message ?? err}); falling back to paste mode`);
     try { engine?.stop(); } catch { /* best effort */ }   // P1-3a: stop the LOCAL ref (codexRpcEngine may be unassigned)
     codexRpcEngine = undefined; remoteWsUrl = undefined; remoteThreadId = undefined;
-    return false;
+    return 'not-engaged';
   }
 }
 
@@ -268,8 +303,6 @@ function armRpcStartupDialogDismiss(): void {
   // which would trigger a self-update. So: if an update dialog is somehow present
   // (config not honored), WARN and do nothing. Only a plain "Press enter to
   // continue" with NO update/menu options gets a single safe Enter.
-  const UPDATE_DIALOG = /Update available|Update now \(runs|Skip until next version/i;
-  const SAFE_CONTINUE = /Press enter to continue/i;
   let warnedUpdate = false;
   const tick = (): void => {
     rpcDialogDismissTimer = null;
@@ -277,12 +310,19 @@ function armRpcStartupDialogDismiss(): void {
     if (Date.now() > deadline) { log('Codex RPC: startup-dialog watch timed out'); return; }
     let screen = '';
     try { screen = renderer?.snapshot().content ?? ''; } catch { /* renderer not ready yet */ }
-    if (UPDATE_DIALOG.test(screen)) {
-      if (!warnedUpdate) { warnedUpdate = true; log('Codex RPC: update dialog appeared despite check_for_update_on_startup=false — NOT auto-pressing (default may be "Update now"); pane may need manual dismissal'); }
-    } else if (SAFE_CONTINUE.test(screen)) {
+    const action = decideStartupDialogAction(screen, cliAdapter?.readyPattern);
+    if (action === 'warn-update') {
+      // Update menu present despite the config disable → NEVER auto-press (default
+      // may be "Update now"); warn the user so they dismiss it manually (P2).
+      if (!warnedUpdate) {
+        warnedUpdate = true;
+        log('Codex RPC: update dialog appeared despite check_for_update_on_startup=false — NOT auto-pressing; asking user to dismiss');
+        send({ type: 'user_notify', message: '⚠️ Codex 更新弹窗挡住了网页终端渲染。为避免误触自更新未自动处理——请在网页终端手动选「Skip」；消息仍经 RPC 正常处理，不影响回复。', turnId: currentBotmuxTurnId });
+      }
+    } else if (action === 'dismiss-safe') {
       log('Codex RPC: dismissing a safe "press enter to continue" prompt on the --remote pane');
       try { backend.write('\r'); } catch { /* best effort */ }
-    } else if (cliAdapter?.readyPattern?.test(screen) === true) {
+    } else if (action === 'ready') {
       return; // composer reached with no blocking dialog → done
     }
     rpcDialogDismissTimer = setTimeout(tick, 2000);
@@ -6404,16 +6444,20 @@ process.on('message', async (raw: unknown) => {
           // transcript file.
           codexBridgeMarkPendingTurn(msg.prompt, msg.turnId);
         }
-        if (msg.prompt && (!codexRpcEngine || rpcDecision.queuePrompt) && (!cliAdapter?.passesInitialPromptViaArgs || deferInitialPrompt)) {
-          // Queue the initial prompt for flushPending. Cases:
-          //  - paste (!codexRpcEngine): normal queue.
-          //  - RPC FRESH (engine set, !queuePrompt): the first turn was already
-          //    pre-sent via JSON-RPC inside engageCodexRpc (to persist the rollout
-          //    an empty thread can't be resumed from) → do NOT re-queue.
-          //  - RPC RESUME (engine set, queuePrompt): the waking prompt was NOT
-          //    pre-sent → queue it so flushPending delivers it via sendTurn AFTER
-          //    the respawned --remote TUI is ready (Codex delta P0-1). The bridge
-          //    is marked at flush time, not here.
+        // Queue the initial prompt for flushPending (pure decision, unit-tested):
+        //  - paste (no engine): normal queue.
+        //  - RPC FRESH accepted/ambiguous: engine set + queuePrompt=false → NEVER
+        //    queue (the turn was pre-sent or is ambiguous; re-queuing = double
+        //    execution — exactly-once, Codex P1-1). Ambiguous never reaches here.
+        //  - RPC RESUME: queuePrompt=true → queue for post-ready flush (bridge
+        //    marked at flush time, P0-1).
+        if (shouldQueueInitialPrompt({
+          hasPrompt: !!msg.prompt,
+          rpcEngineActive: !!codexRpcEngine,
+          queuePrompt: rpcDecision.queuePrompt,
+          passesInitialPromptViaArgs: cliAdapter?.passesInitialPromptViaArgs === true,
+          deferInitialPrompt,
+        })) {
           pendingMessages.push({ content: msg.prompt, turnId: msg.turnId });
         }
 
