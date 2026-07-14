@@ -8559,6 +8559,19 @@ function printPluginUsage(): void {
 `);
 }
 
+function printPluginServiceRunningError(err: unknown): boolean {
+  if (!err || typeof err !== 'object' || (err as any).code !== 'plugin_service_running') return false;
+  const pluginId = String((err as any).pluginId ?? 'unknown');
+  const operation = String((err as any).operation ?? 'update');
+  const status = String((err as any).serviceStatus ?? 'unknown');
+  const pid = typeof (err as any).pid === 'number' ? `, PID ${(err as any).pid}` : '';
+  const operationLabel = operation === 'uninstall' ? '卸载' : operation === 'install' ? '安装' : '更新';
+  console.error(`❌ 无法${operationLabel}插件 ${pluginId}：插件服务仍在运行（${status}${pid}）。`);
+  console.error(`   请先运行: botmux plugin service stop ${pluginId}`);
+  console.error('   Botmux 不会在安装、更新或卸载时隐式停止插件服务。');
+  return true;
+}
+
 async function cmdPlugin(args: string[]): Promise<void> {
   const sub = (args[0] ?? 'list').toLowerCase();
   if (sub === 'help' || sub === '--help' || sub === '-h') {
@@ -8572,7 +8585,16 @@ async function cmdPlugin(args: string[]): Promise<void> {
     const { installPlugin } = await import('./core/plugins/install.js');
     const { resolveOfficialPluginPackageSpec } = await import('./core/plugins/init.js');
     const resolvedSpec = resolveOfficialPluginPackageSpec(spec);
-    const result = installPlugin(resolvedSpec, { link: args.includes('--link') });
+    let result;
+    try {
+      result = installPlugin(resolvedSpec, { link: args.includes('--link') });
+    } catch (err) {
+      if (printPluginServiceRunningError(err)) {
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
     const enabledPlugins = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
     if (enabledPlugins.includes(result.record.id)) {
       const { materializePlugin } = await import('./core/plugins/materializer.js');
@@ -8676,6 +8698,19 @@ async function cmdPlugin(args: string[]): Promise<void> {
       console.error(`❌ 不能卸载 ${pluginId}，以下已启用插件依赖它: ${dependents.join(', ')}`);
       console.error('   请先在对应作用域显式禁用这些插件。');
       process.exit(1);
+    }
+    const installed = registry.plugins[pluginId];
+    if (installed.manifest.service) {
+      const { assertPluginServiceStopped } = await import('./core/plugins/service-manager.js');
+      try {
+        assertPluginServiceStopped(pluginId, 'uninstall');
+      } catch (err) {
+        if (printPluginServiceRunningError(err)) {
+          process.exitCode = 1;
+          return;
+        }
+        throw err;
+      }
     }
     const { dematerializePlugin } = await import('./core/plugins/materializer.js');
     const { deletePluginServices } = await import('./core/plugins/service-manager.js');

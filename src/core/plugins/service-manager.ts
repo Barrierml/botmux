@@ -21,6 +21,22 @@ export interface PluginServiceReport {
   warning?: string;
 }
 
+export type PluginLifecycleOperation = 'install' | 'update' | 'uninstall';
+
+export class PluginServiceRunningError extends Error {
+  readonly code = 'plugin_service_running';
+
+  constructor(
+    readonly pluginId: string,
+    readonly operation: PluginLifecycleOperation,
+    readonly serviceStatus: string,
+    readonly pid?: number,
+  ) {
+    super(`plugin_service_running:${pluginId}:${operation}:${serviceStatus}${pid ? `:${pid}` : ''}`);
+    this.name = 'PluginServiceRunningError';
+  }
+}
+
 interface Pm2AppInfo {
   name: string;
   pid?: number;
@@ -80,6 +96,16 @@ function readPm2Apps(): Pm2AppInfo[] {
 
 function findPm2App(name: string): Pm2AppInfo | undefined {
   return readPm2Apps().find(app => app.name === name);
+}
+
+function isStoppedPm2App(app: Pm2AppInfo): boolean {
+  return app.pid === undefined && (app.status === 'stopped' || app.status === 'errored');
+}
+
+export function assertPluginServiceStopped(pluginId: string, operation: PluginLifecycleOperation): void {
+  const app = findPm2App(pluginPm2AppName(pluginId));
+  if (!app || isStoppedPm2App(app)) return;
+  throw new PluginServiceRunningError(pluginId, operation, app.status ?? 'unknown', app.pid);
 }
 
 function isLoopbackHost(hostname: string): boolean {

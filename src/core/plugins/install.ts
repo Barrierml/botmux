@@ -12,8 +12,9 @@ import {
   pluginConfigPath,
 } from './paths.js';
 import type { InstalledPluginRecord, PluginPackageManifest, PluginSettingsFile } from './types.js';
-import { upsertInstalledPlugin } from '../../services/plugin-registry-store.js';
+import { readPluginRegistry, upsertInstalledPlugin } from '../../services/plugin-registry-store.js';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
+import { assertPluginServiceStopped } from './service-manager.js';
 
 export interface InstallPluginOptions {
   source?: 'auto' | 'npm' | 'local';
@@ -106,11 +107,17 @@ function makeRecord(pkg: PluginPackageManifest, source: InstalledPluginRecord['s
   };
 }
 
+function assertExistingPluginServiceStopped(pluginId: string): void {
+  const existing = readPluginRegistry().plugins[pluginId];
+  if (existing?.manifest.service) assertPluginServiceStopped(pluginId, 'update');
+}
+
 export function installLocalPlugin(spec: string, opts: InstallPluginOptions = {}): InstallPluginResult {
   const sourceDir = resolveLocalSpec(spec);
   const pkg = readPackageManifest(sourceDir);
   const sourceRuntimeDir = requireRuntimeDir(sourceDir);
   const stagedRecord = makeRecord(pkg, { type: 'local', spec: sourceDir }, sourceRuntimeDir);
+  assertExistingPluginServiceStopped(pkg.botmux.id);
   const stagedDir = stageRuntime(pkg.botmux.id, sourceRuntimeDir, opts.link === true);
   let runtimeDir: string;
   try {
@@ -163,6 +170,7 @@ export function installNpmPlugin(spec: string): InstallPluginResult {
     const pkg = readPackageManifest(tmpPackageDir);
     const tmpRuntimeDir = requireRuntimeDir(tmpPackageDir);
     const stagedRecord = makeRecord(pkg, { type: 'npm', spec }, tmpRuntimeDir);
+    assertExistingPluginServiceStopped(pkg.botmux.id);
     const stagedDir = stageRuntime(pkg.botmux.id, tmpRuntimeDir, false);
     let runtimeDir: string;
     try {
