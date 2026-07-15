@@ -92,6 +92,31 @@ export interface McpGatewayDiagnosticsFile {
   servers: McpGatewayDiagnostic[];
 }
 
+interface GatewayInputLifecycle {
+  readonly readableEnded?: boolean;
+  readonly destroyed?: boolean;
+  once(event: 'end' | 'close', listener: () => void): unknown;
+}
+
+export function bindGatewayInputLifecycle(
+  input: GatewayInputLifecycle,
+  closeGateway: () => Promise<void>,
+  onError: (error: unknown) => void = () => undefined,
+): () => Promise<void> {
+  let closing: Promise<void> | undefined;
+  const closeOnce = () => {
+    closing ??= closeGateway();
+    return closing;
+  };
+  const requestClose = () => { void closeOnce().catch(onError); };
+
+  input.once('end', requestClose);
+  input.once('close', requestClose);
+  if (input.readableEnded || input.destroyed) queueMicrotask(requestClose);
+
+  return closeOnce;
+}
+
 function gatewayPluginIds(env: NodeJS.ProcessEnv = process.env): string[] {
   const sessionId = env.BOTMUX_SESSION_ID?.trim();
   if (sessionId) {
@@ -604,8 +629,17 @@ export class PluginMcpGateway {
 export async function runMcpGateway(): Promise<void> {
   const gateway = new PluginMcpGateway();
   const transport = new StdioServerTransport();
-  const close = () => { void gateway.close(); };
-  process.once('SIGINT', close);
-  process.once('SIGTERM', close);
-  await gateway.connect(transport);
+  const connectPromise = gateway.connect(transport);
+  const reportCloseError = (error: unknown) => {
+    process.stderr.write(`[botmux-mcp] shutdown failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    process.exitCode = 1;
+  };
+  const close = bindGatewayInputLifecycle(process.stdin, async () => {
+    await connectPromise.catch(() => undefined);
+    await gateway.close();
+  }, reportCloseError);
+  const requestClose = () => { void close().catch(reportCloseError); };
+  process.once('SIGINT', requestClose);
+  process.once('SIGTERM', requestClose);
+  await connectPromise;
 }

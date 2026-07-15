@@ -2,10 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { PassThrough } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
-import { PluginMcpGateway } from '../src/core/plugins/mcp/gateway.js';
+import { bindGatewayInputLifecycle, PluginMcpGateway } from '../src/core/plugins/mcp/gateway.js';
 
 describe('plugin MCP Gateway', () => {
   let home: string;
@@ -97,5 +98,19 @@ describe('plugin MCP Gateway', () => {
     expect(connectSpy).toHaveBeenCalledWith(expect.anything(), { timeout: 10_000 });
     await client.close();
     await gateway.close();
+  });
+
+  it('closes the Gateway once when its MCP host stdin ends', async () => {
+    const input = new PassThrough();
+    const closeGateway = vi.fn(async () => undefined);
+    const close = bindGatewayInputLifecycle(input, closeGateway);
+
+    input.resume();
+    input.end();
+    await vi.waitFor(() => expect(closeGateway).toHaveBeenCalledTimes(1));
+
+    input.destroy();
+    await close();
+    expect(closeGateway).toHaveBeenCalledTimes(1);
   });
 });
