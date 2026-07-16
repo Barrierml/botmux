@@ -333,6 +333,7 @@ describe('plugin manifest and registry basics', () => {
 
     const result = installLocalPlugin(source, { link: true });
     expect(lstatSync(result.runtimeDir).isSymbolicLink()).toBe(true);
+    expect(result.record.source).toEqual({ type: 'local', spec: source, link: true });
     expect(readFileSync(join(result.runtimeDir, 'marker.txt'), 'utf8')).toBe('v1\n');
 
     writeFileSync(join(source, 'dist', 'marker.txt'), 'v2\n');

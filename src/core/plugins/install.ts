@@ -116,9 +116,14 @@ export function installLocalPlugin(spec: string, opts: InstallPluginOptions = {}
   const sourceDir = resolveLocalSpec(spec);
   const pkg = readPackageManifest(sourceDir);
   const sourceRuntimeDir = requireRuntimeDir(sourceDir);
-  const stagedRecord = makeRecord(pkg, { type: 'local', spec: sourceDir }, sourceRuntimeDir);
+  const linked = opts.link === true;
+  const stagedRecord = makeRecord(pkg, {
+    type: 'local',
+    spec: sourceDir,
+    ...(linked ? { link: true } : {}),
+  }, sourceRuntimeDir);
   assertExistingPluginServiceStopped(pkg.botmux.id);
-  const stagedDir = stageRuntime(pkg.botmux.id, sourceRuntimeDir, opts.link === true);
+  const stagedDir = stageRuntime(pkg.botmux.id, sourceRuntimeDir, linked);
   let runtimeDir: string;
   try {
     ensurePluginStateFiles(pkg.botmux.id);

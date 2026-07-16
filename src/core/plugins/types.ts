@@ -84,6 +84,7 @@ export interface InstalledPluginRecord {
   source: {
     type: 'npm' | 'local';
     spec: string;
+    link?: boolean;
   };
   manifest: BotmuxPluginManifest;
   contributions?: PluginContributions;
