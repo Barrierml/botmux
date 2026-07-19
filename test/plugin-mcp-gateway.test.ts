@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { bindGatewayInputLifecycle, PluginMcpGateway } from '../src/core/plugins/mcp/gateway.js';
 
@@ -40,6 +41,32 @@ describe('plugin MCP Gateway', () => {
       command: [process.execPath, fixture, fixtureName],
     }));
     installLocalPlugin(source);
+  }
+
+  function mcpServeEnvironment(sessionId: string): Record<string, string> {
+    const env = Object.fromEntries(
+      Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    );
+    delete env.SESSION_DATA_DIR;
+    return {
+      ...env,
+      HOME: home,
+      USERPROFILE: home,
+      BOTMUX_SESSION_ID: sessionId,
+    };
+  }
+
+  async function connectMcpServe(sessionId: string): Promise<Client> {
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', resolve('src/cli.ts'), 'mcp', 'serve'],
+      cwd: resolve('.'),
+      env: mcpServeEnvironment(sessionId),
+      stderr: 'pipe',
+    });
+    const client = new Client({ name: 'mcp-serve-test', version: '1.0.0' });
+    await client.connect(transport);
+    return client;
   }
 
   it('aggregates paginated lists, aliases collisions, and routes direct operations', async () => {
@@ -98,6 +125,57 @@ describe('plugin MCP Gateway', () => {
     expect(connectSpy).toHaveBeenCalledWith(expect.anything(), { timeout: 10_000 });
     await client.close();
     await gateway.close();
+  });
+
+  it('keeps serving when diagnostics cannot be persisted', async () => {
+    const blockedDataDir = join(home, 'not-a-directory');
+    writeFileSync(blockedDataDir, 'blocked');
+    vi.stubEnv('SESSION_DATA_DIR', blockedDataDir);
+    const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+
+    const gateway = new PluginMcpGateway([]);
+    const client = new Client({ name: 'gateway-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    expect((await client.listTools()).tools).toEqual([]);
+    expect(stderr).toHaveBeenCalledWith(expect.stringContaining('[botmux-mcp] diagnostics write skipped:'));
+
+    await client.close();
+    await gateway.close();
+  });
+
+  it('uses ~/.botmux/data when mcp serve starts without SESSION_DATA_DIR', async () => {
+    const sessionId = 'mcp-serve-default-data-dir';
+    const diagnostics = join(home, '.botmux', 'data', 'mcp-gateway', `${sessionId}.json`);
+    const client = await connectMcpServe(sessionId);
+    try {
+      expect((await client.listTools()).tools).toEqual([]);
+      await vi.waitFor(() => expect(existsSync(diagnostics)).toBe(true));
+      expect(JSON.parse(readFileSync(diagnostics, 'utf-8')).sessionId).toBe(sessionId);
+    } finally {
+      await client.close();
+      rmSync(resolve('data', 'mcp-gateway', `${sessionId}.json`), { force: true });
+    }
+  });
+
+  it('keeps the existing data-dir breadcrumb behavior for mcp serve', async () => {
+    const sessionId = 'mcp-serve-custom-data-dir';
+    const customDataDir = join(home, 'custom-data');
+    mkdirSync(join(home, '.botmux'), { recursive: true });
+    mkdirSync(customDataDir, { recursive: true });
+    writeFileSync(join(customDataDir, 'sessions.json'), '{}');
+    writeFileSync(join(home, '.botmux', '.data-dir'), `${customDataDir}\n`);
+    const diagnostics = join(customDataDir, 'mcp-gateway', `${sessionId}.json`);
+
+    const client = await connectMcpServe(sessionId);
+    try {
+      expect((await client.listTools()).tools).toEqual([]);
+      await vi.waitFor(() => expect(existsSync(diagnostics)).toBe(true));
+    } finally {
+      await client.close();
+      rmSync(resolve('data', 'mcp-gateway', `${sessionId}.json`), { force: true });
+    }
   });
 
   it('closes the Gateway once when its MCP host stdin ends', async () => {

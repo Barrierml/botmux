@@ -266,13 +266,19 @@ export class PluginMcpGateway {
   }
 
   private persistDiagnostics(): void {
-    writeDiagnostics({
-      schemaVersion: 1,
-      sessionId: process.env.BOTMUX_SESSION_ID?.trim() || undefined,
-      pluginIds: this.pluginIds,
-      generatedAt: new Date().toISOString(),
-      servers: this.diagnostics,
-    });
+    try {
+      writeDiagnostics({
+        schemaVersion: 1,
+        sessionId: process.env.BOTMUX_SESSION_ID?.trim() || undefined,
+        pluginIds: this.pluginIds,
+        generatedAt: new Date().toISOString(),
+        servers: this.diagnostics,
+      });
+    } catch (error) {
+      process.stderr.write(
+        `[botmux-mcp] diagnostics write skipped: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
   }
 
   private ensureInitialized(): Promise<void> {

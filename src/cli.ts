@@ -8859,6 +8859,7 @@ switch (command) {
       process.exitCode = 2;
       break;
     }
+    process.env.SESSION_DATA_DIR ??= resolveDataDir();
     const { runMcpGateway } = await import('./core/plugins/mcp/gateway.js');
     await runMcpGateway();
     break;
