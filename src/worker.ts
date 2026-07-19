@@ -60,7 +60,7 @@ import {
   evaluateVcMeetingManagedSend,
 } from './services/vc-meeting-send-policy.js';
 import { TurnTerminalDeduper } from './services/turn-terminal-deduper.js';
-import { ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import { prepareCliPluginGeneration } from './core/plugins/cli-generation.js';
 import { loadBotConfigs, type BotConfig } from './bot-registry.js';
 import { readGlobalConfig } from './global-config.js';
@@ -265,6 +265,7 @@ function refreshCliPluginGeneration(
   }
   cfg.skillPluginDir = generation.skillPluginDir;
   cfg.skillReadonlyRoots = generation.skillReadonlyRoots;
+  cfg.mcpReadonlyRoots = generation.mcpReadonlyRoots;
   deferredPluginSkillCatalog = generation.deferredSkillCatalog ?? null;
   log(`Plugin generation refreshed: ${generation.pluginManifest.pluginIds.join(', ') || '(none)'}`);
 }
@@ -6194,7 +6195,12 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
             ? [sendCredFilePath(dataDir, cfg.larkAppId)]
             : [],
           extraExecPaths: cliAdapter.sandboxExtraExecPaths?.(),
-          readonlyRoots: [...(cfg.skillReadonlyRoots ?? []), ...(readIsoLinuxMasks?.ownReadOnlyPaths ?? [])],
+          readonlyRoots: [
+            ...(cfg.skillReadonlyRoots ?? []),
+            ...(cfg.mcpReadonlyRoots ?? []),
+            ...(readIsoLinuxMasks?.ownReadOnlyPaths ?? []),
+          ],
+          trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
           userReadonlyPaths: cfg.sandboxReadonlyPaths ?? [],
           net: cfg.sandboxNetwork !== false,
         });

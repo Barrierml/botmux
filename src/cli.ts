@@ -8689,39 +8689,53 @@ async function cmdPlugin(args: string[]): Promise<void> {
   if (sub === 'uninstall' || sub === 'remove' || sub === 'rm') {
     const pluginId = requirePluginId(args[1]);
     assertPluginInstalled(pluginId);
-    const enabledEverywhere = new Set(normalizePluginIdList(readGlobalConfig().plugins) ?? []);
-    for (const bot of loadBotsJson()) {
-      for (const id of normalizePluginIdList(bot.plugins) ?? []) enabledEverywhere.add(id);
-    }
-    const dependents = enabledPluginDependents(pluginId, [...enabledEverywhere], registry);
-    if (dependents.length > 0) {
-      console.error(`❌ 不能卸载 ${pluginId}，以下已启用插件依赖它: ${dependents.join(', ')}`);
-      console.error('   请先在对应作用域显式禁用这些插件。');
-      process.exit(1);
-    }
-    const installed = registry.plugins[pluginId];
-    if (installed.manifest.service) {
-      const { assertPluginServiceStopped } = await import('./core/plugins/service-manager.js');
-      try {
-        assertPluginServiceStopped(pluginId, 'uninstall');
-      } catch (err) {
-        if (printPluginServiceRunningError(err)) {
-          process.exitCode = 1;
-          return;
-        }
-        throw err;
-      }
-    }
+    const {
+      assertPluginServiceStopped,
+      deletePluginServicesUnlocked,
+      withPluginServiceLock,
+    } = await import('./core/plugins/service-manager.js');
     const { dematerializePlugin } = await import('./core/plugins/materializer.js');
-    const { deletePluginServices } = await import('./core/plugins/service-manager.js');
-    dematerializePlugin(pluginId);
-    await deletePluginServices([pluginId]);
-    await removePluginSkillRegistryEntries(pluginId);
-    const { removeInstalledPlugin } = await import('./services/plugin-registry-store.js');
+    const { readPluginRegistry, removeInstalledPlugin } = await import('./services/plugin-registry-store.js');
     const { pluginHome } = await import('./core/plugins/paths.js');
-    removeInstalledPlugin(pluginId);
-    removePluginBindingsEverywhere(pluginId);
-    rmSync(pluginHome(pluginId), { recursive: true, force: true });
+    try {
+      await withPluginServiceLock(async () => {
+        const lockedRegistry = readPluginRegistry();
+        const installed = lockedRegistry.plugins[pluginId];
+        if (!installed) throw new Error(`plugin_not_installed:${pluginId}`);
+
+        const enabledEverywhere = new Set(normalizePluginIdList(readGlobalConfig().plugins) ?? []);
+        for (const bot of loadBotsJson()) {
+          for (const id of normalizePluginIdList(bot.plugins) ?? []) enabledEverywhere.add(id);
+        }
+        const dependents = enabledPluginDependents(pluginId, [...enabledEverywhere], lockedRegistry);
+        if (dependents.length > 0) {
+          throw new Error(`plugin_has_enabled_dependents:${pluginId}:${dependents.join(',')}`);
+        }
+        if (installed.manifest.service) {
+          assertPluginServiceStopped(pluginId, 'uninstall');
+        }
+
+        dematerializePlugin(pluginId);
+        await deletePluginServicesUnlocked([pluginId]);
+        await removePluginSkillRegistryEntries(pluginId);
+        removeInstalledPlugin(pluginId);
+        removePluginBindingsEverywhere(pluginId);
+        rmSync(pluginHome(pluginId), { recursive: true, force: true });
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith(`plugin_has_enabled_dependents:${pluginId}:`)) {
+        const dependents = err.message.slice(`plugin_has_enabled_dependents:${pluginId}:`.length).split(',').filter(Boolean);
+        console.error(`❌ 不能卸载 ${pluginId}，以下已启用插件依赖它: ${dependents.join(', ')}`);
+        console.error('   请先在对应作用域显式禁用这些插件。');
+        process.exitCode = 1;
+        return;
+      }
+      if (printPluginServiceRunningError(err)) {
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
     console.log(`✅ 已卸载插件: ${pluginId}`);
     return;
   }

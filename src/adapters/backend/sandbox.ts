@@ -405,7 +405,11 @@ export function resolveUserReadonlyRoots(
 /** Absolute path to this build's compiled cli.js (dist/cli.js), derived from
  *  this module's own location (dist/adapters/backend/sandbox.js → ../../cli.js). */
 function distCliJs(): string {
-  return fileURLToPath(new URL('../../cli.js', import.meta.url));
+  const colocated = fileURLToPath(new URL('../../cli.js', import.meta.url));
+  if (existsSync(colocated)) return colocated;
+  // `pnpm daemon` loads this module from src/ through tsx, while the trusted
+  // sandbox shim must still execute the built CLI entrypoint.
+  return fileURLToPath(new URL('../../../dist/cli.js', import.meta.url));
 }
 
 /** Is file-sandbox enabled for this session? Spike gate = env; the real
@@ -554,6 +558,10 @@ export function prepareSandbox(opts: {
   /** Runtime-generated roots that should be visible read-only inside bwrap.
    *  Trusted (daemon-produced) — bound after the privacy masks. */
   readonlyRoots?: readonly string[];
+  /** Absolute Botmux command paths already written into a CLI's MCP config.
+   * When a target lives below the masked BOTMUX_HOME, bind the trusted relay
+   * shim at that exact path so an absolute MCP command remains executable. */
+  trustedBotmuxCommandPaths?: readonly string[];
   /** Daemon-derived private roots to re-open writable after mandatory masks. */
   trustedWritablePaths?: readonly string[];
   /** Credential paths to re-mask after trusted writable carve-outs. */
@@ -785,6 +793,18 @@ export function prepareSandbox(opts: {
   // read-only (`--ro-bind / /`), so bwrap can't mkdir a new mountpoint at the
   // root (/sbxbin) → it must live under a writable tmpfs (/run). PATH points here.
   args.push('--ro-bind', shimBin, '/run/sbxbin');
+  for (const rawTarget of [...new Set(opts.trustedBotmuxCommandPaths ?? [])]) {
+    if (!rawTarget || typeof rawTarget !== 'string') continue;
+    const target = resolve(expandTilde(rawTarget, home));
+    const rel = relative(botmuxHome, target);
+    if (!rel || rel === '..' || rel.startsWith('../') || isAbsolute(rel)) continue;
+    let current = botmuxHome;
+    for (const segment of dirname(rel).split('/').filter(segment => segment && segment !== '.')) {
+      current = join(current, segment);
+      args.push('--dir', current);
+    }
+    args.push('--ro-bind', shim, target);
+  }
   // botmux skill/plugin dir (claude `--plugin-dir` points here; carries the
   // botmux-send etc. skills, no secrets). Re-exposed read-only at its real path.
   const pluginDir = join(home, '.botmux', 'claude-plugin');

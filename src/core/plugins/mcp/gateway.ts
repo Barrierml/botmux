@@ -42,6 +42,10 @@ import { resolveSessionContext } from '../../session-marker.js';
 import { normalizePluginIdList } from '../ids.js';
 import { pluginHome, pluginRuntimeDir, resolvePluginPath } from '../paths.js';
 import { readSessionPluginManifest } from '../session-manifest.js';
+import {
+  readSessionMcpRuntimeManifest,
+  type SessionMcpRuntimeManifest,
+} from './session-runtime.js';
 import type { PluginMcpServer } from '../types.js';
 
 const GATEWAY_VERSION = '1.0.0';
@@ -158,6 +162,34 @@ function gatewayDescriptors(pluginIds: readonly string[]): GatewayDescriptor[] {
   return descriptors;
 }
 
+function snapshotGatewayDescriptors(snapshot: SessionMcpRuntimeManifest): GatewayDescriptor[] {
+  return snapshot.entries.map(entry => ({
+    key: entry.pluginId,
+    routeName: entry.pluginId,
+    pluginId: entry.pluginId,
+    server: entry.server,
+    pluginDir: entry.pluginDir,
+  }));
+}
+
+function resolveGatewayRuntime(
+  requestedPluginIds: string[] | undefined,
+  env: NodeJS.ProcessEnv,
+): { pluginIds: string[]; descriptors: GatewayDescriptor[] } {
+  if (!requestedPluginIds) {
+    const sessionId = env.BOTMUX_SESSION_ID?.trim();
+    const snapshot = sessionId ? readSessionMcpRuntimeManifest(sessionId) : null;
+    if (snapshot) {
+      return {
+        pluginIds: snapshot.pluginIds,
+        descriptors: snapshotGatewayDescriptors(snapshot),
+      };
+    }
+  }
+  const pluginIds = requestedPluginIds ?? gatewayPluginIds(env);
+  return { pluginIds, descriptors: gatewayDescriptors(pluginIds) };
+}
+
 function diagnosticsPath(sessionId: string | undefined): string {
   const safe = sessionId && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sessionId)
     ? sessionId
@@ -245,8 +277,9 @@ export class PluginMcpGateway {
 
   constructor(pluginIds?: string[], env: NodeJS.ProcessEnv = process.env) {
     this.env = env;
-    this.pluginIds = pluginIds ?? gatewayPluginIds(env);
-    this.descriptors = gatewayDescriptors(this.pluginIds);
+    const runtime = resolveGatewayRuntime(pluginIds, env);
+    this.pluginIds = runtime.pluginIds;
+    this.descriptors = runtime.descriptors;
     this.server = new Server(
       { name: 'botmux', version: GATEWAY_VERSION },
       {

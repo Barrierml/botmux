@@ -10,11 +10,12 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
+import { chmodSync, mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { buildSandboxArgs, buildRelayHostEnv, reexposeRunBinArgs, validateRelayRequest, materializeOutboxFile, prepareSandbox, resolveSandboxMountPath, sandboxedClaudeDataDir, sandboxCredentialHidePaths, resolveUserReadonlyRoots, sandboxOverlayPaths, type SandboxPlan } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { computeSandboxDiff, applySandboxDiff, upperDir } from '../src/services/sandbox-land.js';
+import { defaultGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
 
@@ -799,6 +800,55 @@ describe('resolveUserReadonlyRoots', () => {
 });
 
 describe.skipIf(process.platform !== 'linux')('prepareSandbox hidePaths masks', () => {
+  it('keeps the configured botmux MCP Gateway command executable inside the sandbox', () => {
+    const root = tmp();
+    const home = join(root, 'home');
+    const project = join(root, 'project');
+    const dataDir = join(home, '.botmux', 'data');
+    const gatewayBin = join(home, '.botmux', 'bin', 'botmux');
+    mkdirSync(project, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(join(home, '.botmux', 'bin'), { recursive: true });
+    writeFileSync(gatewayBin, '#!/bin/sh\nexit 0\n');
+    chmodSync(gatewayBin, 0o755);
+
+    const previousHome = process.env.HOME;
+    const previousBotmuxBin = process.env.BOTMUX_BIN_PATH;
+    process.env.HOME = home;
+    delete process.env.BOTMUX_BIN_PATH;
+    let r: ReturnType<typeof prepareSandbox> = null;
+    try {
+      const gateway = defaultGatewayEntry();
+      expect(gateway.command).toBe(gatewayBin);
+      r = prepareSandbox({
+        enabled: true,
+        cliId: 'codex',
+        sessionId: `gateway-command-${Math.random().toString(36).slice(2)}`,
+        sourceWorkingDir: project,
+        dataDir,
+        cliBin: '/bin/sh',
+        cliArgs: ['-c', `test -x ${JSON.stringify(gateway.command)}`],
+        trustedBotmuxCommandPaths: [gateway.command],
+      });
+      if (r === null) return; // overlay runtime unavailable in this env
+
+      const run = spawnSync(r.bin, r.args, {
+        env: { ...process.env, ...r.env },
+        encoding: 'utf8',
+        timeout: 10_000,
+      });
+      expect(run.error).toBeUndefined();
+      expect(run.status, run.stderr).toBe(0);
+    } finally {
+      if (r) r.cleanup();
+      if (previousHome !== undefined) process.env.HOME = previousHome;
+      else delete process.env.HOME;
+      if (previousBotmuxBin !== undefined) process.env.BOTMUX_BIN_PATH = previousBotmuxBin;
+      else delete process.env.BOTMUX_BIN_PATH;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('runs with projectMount=HOME using one external project upper (no recursive/shadowed overlay)', () => {
     const root = tmp();
     const home = join(root, 'home');

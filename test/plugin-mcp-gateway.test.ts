@@ -12,6 +12,7 @@ import {
   PluginMcpGateway,
   resolveGatewayEnvironment,
 } from '../src/core/plugins/mcp/gateway.js';
+import { refreshSessionMcpRuntimeManifest } from '../src/core/plugins/mcp/session-runtime.js';
 
 describe('plugin MCP Gateway', () => {
   let home: string;
@@ -156,6 +157,29 @@ describe('plugin MCP Gateway', () => {
 
     const result = await client.callTool({ name: 'echo', arguments: {} });
     expect((result.content[0] as any).text).toContain('session=session-downstream');
+
+    await client.close();
+    await gateway.close();
+  });
+
+  it('uses the session MCP runtime snapshot without reading the global plugin registry', async () => {
+    installFixturePlugin('plugin-a', 'alpha');
+    refreshSessionMcpRuntimeManifest({
+      sessionId: 'snapshot-session',
+      pluginIds: ['plugin-a'],
+      dataDir: join(home, '.botmux', 'data'),
+    });
+    rmSync(join(home, '.botmux', 'plugins-registry.json'), { force: true });
+
+    const gateway = new PluginMcpGateway(
+      undefined,
+      { ...process.env, BOTMUX_SESSION_ID: 'snapshot-session' },
+    );
+    const client = new Client({ name: 'gateway-snapshot-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    expect((await client.listTools()).tools.map(tool => tool.name).sort()).toEqual(['alpha_unique', 'echo']);
 
     await client.close();
     await gateway.close();

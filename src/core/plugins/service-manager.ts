@@ -62,6 +62,10 @@ export function withPluginServiceLockSync<T>(fn: () => T): T {
   return withFileLockSync(serviceLockTarget(), fn, { maxWaitMs: 30_000 });
 }
 
+export function withPluginServiceLock<T>(fn: () => Promise<T> | T): Promise<T> {
+  return withFileLock(serviceLockTarget(), async () => fn(), { maxWaitMs: 30_000 });
+}
+
 function definitionEnv(record: InstalledPluginRecord, definition: PluginServiceDefinition): Record<string, string> {
   return {
     ...(definition.pm2.env ?? {}),
@@ -339,7 +343,7 @@ export async function startPluginServices(
   pluginIds?: readonly string[],
   options: { autoOnly?: boolean } = {},
 ): Promise<PluginServiceReport[]> {
-  return withFileLock(serviceLockTarget(), async () => {
+  return withPluginServiceLock(async () => {
     const reports: PluginServiceReport[] = [];
     for (const record of selectedRecords(pluginIds, options.autoOnly === true)) {
       try {
@@ -354,14 +358,14 @@ export async function startPluginServices(
       }
     }
     return reports;
-  }, { maxWaitMs: 30_000 });
+  });
 }
 
 export async function stopPluginServices(
   pluginIds?: readonly string[],
   options: { autoOnly?: boolean } = {},
 ): Promise<PluginServiceReport[]> {
-  return withFileLock(serviceLockTarget(), async () => {
+  return withPluginServiceLock(async () => {
     const reports: PluginServiceReport[] = [];
     for (const record of selectedRecords(pluginIds, options.autoOnly === true)) {
       try {
@@ -383,26 +387,28 @@ export async function stopPluginServices(
       }
     }
     return reports;
-  }, { maxWaitMs: 30_000 });
+  });
+}
+
+export async function deletePluginServicesUnlocked(pluginIds?: readonly string[]): Promise<PluginServiceReport[]> {
+  const reports: PluginServiceReport[] = [];
+  for (const record of selectedRecords(pluginIds)) {
+    try {
+      const definition = await loadPluginServiceDefinition(record);
+      if (!definition) continue;
+      const name = pluginPm2AppName(record.id);
+      if (findPm2App(name)) runPluginPm2(['delete', name], { inherit: false, timeoutMs: 30_000 });
+      deleteServiceState(record.id);
+      reports.push(reportFromState(record, 'deleted', undefined));
+    } catch (err: any) {
+      reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
+    }
+  }
+  return reports;
 }
 
 export async function deletePluginServices(pluginIds?: readonly string[]): Promise<PluginServiceReport[]> {
-  return withFileLock(serviceLockTarget(), async () => {
-    const reports: PluginServiceReport[] = [];
-    for (const record of selectedRecords(pluginIds)) {
-      try {
-        const definition = await loadPluginServiceDefinition(record);
-        if (!definition) continue;
-        const name = pluginPm2AppName(record.id);
-        if (findPm2App(name)) runPluginPm2(['delete', name], { inherit: false, timeoutMs: 30_000 });
-        deleteServiceState(record.id);
-        reports.push(reportFromState(record, 'deleted', undefined));
-      } catch (err: any) {
-        reports.push(reportFromState(record, 'failed', readServiceState(record.id), err?.message ?? String(err)));
-      }
-    }
-    return reports;
-  }, { maxWaitMs: 30_000 });
+  return withPluginServiceLock(() => deletePluginServicesUnlocked(pluginIds));
 }
 
 export async function listPluginServiceStatus(): Promise<PluginServiceReport[]> {
