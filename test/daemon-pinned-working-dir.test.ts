@@ -168,6 +168,40 @@ describe('resolvePinnedWorkingDir', () => {
     expect(result.pinnedFromBotDefault).toBe(true);
   });
 
+  it('inherits a chat-level oncall binding from another bot over this bot\'s own defaultWorkingDir (chained invites)', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const boundDir = tempDir('bound-worktree');
+    const defaultDir = tempDir('default-repo');
+    // Another bot bound this chat to the task worktree; app-self was pulled in
+    // later and only has its own defaultWorkingDir. The chat-level binding must
+    // win so chained invites land in the group workdir (2026-08-19 incident:
+    // @mention-spawned sessions fell through to the bot default dir).
+    botRegistry.registerBot({
+      larkAppId: 'app-peer',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      oncallChats: [{ chatId: 'oc_chat', workingDir: boundDir }],
+    });
+    botRegistry.registerBot({
+      larkAppId: 'app-self',
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      defaultWorkingDir: defaultDir,
+      chatOncallInherit: true,
+    });
+
+    const result = await daemon.__testOnly_resolvePinnedWorkingDir({
+      scope: 'thread',
+      anchor: 'om_root',
+      chatId: 'oc_chat',
+      chatType: 'group',
+      larkAppId: 'app-self',
+    });
+
+    expect(result.pinnedWorkingDir).toBe(boundDir);
+    expect(result.pinnedFromBotDefault).toBe(false);
+  });
+
   it('inherits a same-anchor peer workingDir ONLY when this bot has no oncall binding and no default dir of its own', async () => {
     const { botRegistry, sessionStore, daemon } = await loadFreshModules();
     const peerDir = tempDir('peer-repo');

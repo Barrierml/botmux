@@ -1631,6 +1631,15 @@ export interface BotConfig {
    */
   botToBotSameDir?: boolean;
   /**
+   * 群级目录继承 (chat-level oncall inheritance). When this bot is spawned in a
+   * chat where ANOTHER bot holds an oncall binding, inherit that binding's
+   * workingDir instead of falling through to this bot's own defaultWorkingDir.
+   * Default OFF (upstream per-bot pin semantics); enable for team bots that
+   * share task-group worktrees — covers late / chained invites (bot 拉 bot).
+   * Read-only inheritance: no state write, no permission change.
+   */
+  chatOncallInherit?: boolean;
+  /**
    * 平台团队页是否展示这个 bot. When false, this bot is hidden from the central
    * platform's team roster (人→机器→bot view). Default ON (undefined = shown);
    * set to false to keep an internal/utility bot off the team page.
@@ -2949,6 +2958,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       privateCard: entry.privateCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
+      // Opt-in chat-level oncall inheritance (default off = upstream per-bot pin).
+      chatOncallInherit: entry.chatOncallInherit === true || undefined,
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。
       showInTeam: entry.showInTeam === false ? false : undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,

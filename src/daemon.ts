@@ -60,6 +60,7 @@ import {
   getAllBots,
   getOwnerOpenId,
   findOncallChat,
+  findOncallChatForAnyBot,
   effectiveDefaultWorkingDir,
   effectiveBotDisplayName,
   resolveVcMeetingConsumerProfiles,
@@ -16017,6 +16018,15 @@ async function resolvePinnedWorkingDir(ctx: {
   let oncallEntry = findOncallChat(ctx.larkAppId, ctx.chatId);
   if (!oncallEntry) {
     oncallEntry = await maybeAutoBindDefaultOncall(ctx.larkAppId, ctx.chatId, ctx.chatType);
+  }
+  // Chat-level workdir inheritance (opt-in via chatOncallInherit): when this
+  // bot has no binding of its own, inherit ANY bot's oncall binding for this
+  // chat (disk-scanned, mtime-cached, read-only — no state write, no permission
+  // change). A bot pulled into a task group later — including chained
+  // bot-invites-bot — lands in the group's bound workdir instead of falling
+  // through to its own defaultWorkingDir. Default off: upstream per-bot pin.
+  if (!oncallEntry && getBot(ctx.larkAppId).config.chatOncallInherit === true) {
+    oncallEntry = findOncallChatForAnyBot(ctx.chatId) ?? undefined;
   }
   // Resolve the bot default first so we know whether inheritance is only the
   // ordinary last-resort fallback or must preempt an auto-created worktree.
