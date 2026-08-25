@@ -7,6 +7,7 @@ import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import { PI_TURN_BOUNDARY_EXTENSION_SOURCE } from './pi-turn-boundary-extension-data.js';
+import { resolvePiModelFlag } from './pi-model.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
@@ -106,7 +107,8 @@ export function buildPiArgs(opts: {
   // title the user changed inside the CLI. Fresh spawns are the only ones that
   // should stamp the Botmux title.
   if (!opts.resume && opts.nativeSessionTitle?.trim()) args.push('--name', opts.nativeSessionTitle.trim());
-  if (opts.model?.trim()) args.push('--model', opts.model.trim());
+  const resolvedModel = resolvePiModelFlag(opts.model);
+  if (resolvedModel) args.push('--model', resolvedModel);
   if (opts.builtinSkillsDir) args.push('--skill', opts.builtinSkillsDir);
   if (opts.skillPluginDir) args.push('--skill', opts.skillPluginDir);
   if (opts.appendSystemPrompt) {
