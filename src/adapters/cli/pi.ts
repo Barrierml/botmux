@@ -7,12 +7,13 @@ import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import { PI_TURN_BOUNDARY_EXTENSION_SOURCE } from './pi-turn-boundary-extension-data.js';
-import { resolvePiModelFlag } from './pi-model.js';
+import { resolvePiModel } from './pi-model.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
 
 import { delay } from '../../utils/timing.js';
+import { logger } from '../../utils/logger.js';
 
 /** botmux ships its built-in skills for Pi here and injects it per-session via
  *  `--skill` (see buildArgs). Kept out of the global `~/.pi/agent/skills` so a
@@ -107,8 +108,7 @@ export function buildPiArgs(opts: {
   // title the user changed inside the CLI. Fresh spawns are the only ones that
   // should stamp the Botmux title.
   if (!opts.resume && opts.nativeSessionTitle?.trim()) args.push('--name', opts.nativeSessionTitle.trim());
-  const resolvedModel = resolvePiModelFlag(opts.model);
-  if (resolvedModel) args.push('--model', resolvedModel);
+  if (opts.model?.trim()) args.push('--model', opts.model.trim());
   if (opts.builtinSkillsDir) args.push('--skill', opts.builtinSkillsDir);
   if (opts.skillPluginDir) args.push('--skill', opts.skillPluginDir);
   if (opts.appendSystemPrompt) {
@@ -123,6 +123,46 @@ export function buildPiArgs(opts: {
   // startup, avoiding stdin races while keeping the native TUI visible.
   if (opts.initialPrompt) args.push(opts.initialPrompt);
   return args;
+}
+
+/**
+ * Resolve BotConfig.model to pi's --model flag against the ENV the pi process
+ * will actually be spawned with, and log every implicit decision. The rewrite
+ * crosses a config boundary (bots.json slug → pi-side settings.defaultProvider),
+ * so silence would make "configured X but argv says Y" unauditable; the bare
+ * passthrough additionally warns how pi itself fails on a cross-provider id.
+ */
+export function resolvePiModelForSpawn(
+  model: string | undefined,
+  childEnv: NodeJS.ProcessEnv,
+): string | undefined {
+  const resolution = resolvePiModel(model, { env: childEnv });
+  switch (resolution.kind) {
+    case 'none':
+      return undefined;
+    case 'qualified':
+      logger.debug(`pi: --model "${resolution.flag}" already provider-qualified; passed as-is`);
+      return resolution.flag;
+    case 'prefixed':
+      logger.info(
+        `pi: --model "${model!.trim()}" → "${resolution.flag}" ` +
+          `(qualified with settings.defaultProvider="${resolution.provider}" from ${resolution.settingsPath})`,
+      );
+      return resolution.flag;
+    case 'bare': {
+      const ambiguityHint = 'pi exits when this id is ambiguous across authenticated providers (use provider/id)';
+      if (resolution.state === 'invalid') {
+        logger.warn(
+          `pi: --model "${resolution.flag}" left unqualified: settings file ${resolution.settingsPath} is unreadable; ${ambiguityHint}`,
+        );
+      } else {
+        logger.info(
+          `pi: --model "${resolution.flag}" left unqualified (no defaultProvider in ${resolution.settingsPath}); ${ambiguityHint}`,
+        );
+      }
+      return resolution.flag;
+    }
+  }
 }
 
 /** Adapter for Pi coding-agent's native TUI (`pi`).
@@ -259,12 +299,16 @@ export function createPiAdapter(
         env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
       }
 
+      // Resolve against the child env (per-bot env wins over daemon env), the
+      // same env pi sees, so an agent-dir overlay / HOME redirect is honored.
+      const resolvedModel = resolvePiModelForSpawn(model, { ...process.env, ...env });
+
       return buildPiArgs({
         sessionId,
         resume,
         initialPrompt,
         nativeSessionTitle,
-        model,
+        model: resolvedModel,
         turnBoundaryExtension: turnBoundaryExt,
         builtinSkillsDir: promptInjection === 'none' ? undefined : PI_BUILTIN_SKILLS_DIR,
         skillPluginDir: promptInjection === 'none' ? undefined : skillPluginDir,
